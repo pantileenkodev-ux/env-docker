@@ -7,16 +7,17 @@ networks:
       driver: default
       config:
         - subnet: 10.10.10.0/24
+  # Внешняя сеть Traefik. Создается один раз командой:
+  #   docker network create proxy
+  proxy:
+    external: true
+    name: ${TRAEFIK_NETWORK:-proxy}
 volumes:
   redis_data:
     driver: local
   mysql_log_data:
     driver: local
   mysql_lib_data:
-    driver: local
-  postgres_data:
-    driver: local
-  www_data:
     driver: local
   bxtemp_data:
     driver: local
@@ -25,8 +26,6 @@ volumes:
   browscap_data:
     driver: local
   geoip2_data:
-    driver: local
-  ssl_data:
     driver: local
 services:
   memcached:
@@ -87,44 +86,6 @@ services:
       dev:
         aliases:
           - redis
-  postgres:
-    #image: postgres:14.23-trixie
-    #image: postgres:15.18-trixie
-    image: postgres:16.14-trixie
-    #image: postgres:17.10-trixie
-    #image: postgres:18.4-trixie
-    container_name: dev_postgres
-    restart: unless-stopped
-    env_file:
-      - .env
-      - .env_sql
-#    ports:
-#      - "5432:5432"
-    volumes:
-      # for postgresql 14.x - 17.x
-      - postgres_data:/var/lib/postgresql/data
-      # for postgresql 18.x
-      #- postgres_data:/var/lib/postgresql
-    init: true
-    cgroup: private
-    security_opt:
-      - no-new-privileges
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - FOWNER
-      - SETUID
-      - SETGID
-      - DAC_OVERRIDE
-    tmpfs:
-      - /tmp:noexec,nodev,nosuid
-      - /var/tmp:noexec,nodev,nosuid
-      - /dev/shm:noexec,nodev,nosuid
-    networks:
-      dev:
-        aliases:
-          - postgres
   mysql:
     image: quay.io/bitrix24/percona-server:8.0.46-v1-rhel
     #image: quay.io/bitrix24/percona-server:8.4.10-v1-rhel
@@ -172,12 +133,11 @@ services:
       #- ./confs/php83/etc/:/usr/local/etc/
       #- ./confs/php84/etc/:/usr/local/etc/
       #- ./confs/php85/etc/:/usr/local/etc/
-      - www_data:/opt/www/
+      - ./www/:/opt/www/
       - bxtemp_data:/opt/.bx_temp/
       - msmtp_data:/opt/msmtp/
       - browscap_data:/opt/browscap/
       - geoip2_data:/opt/geoip2/
-      - ssl_data:/ssl/
     init: true
     cgroup: private
     security_opt:
@@ -194,21 +154,20 @@ services:
           - php
     depends_on:
       - mysql
-      - postgres
   nginx:
     image: quay.io/bitrix24/nginx:1.30.4-v1-alpine
     container_name: dev_nginx
     restart: unless-stopped
     env_file:
       - .env
-    ports:
-      - "8588:80"
-      - "8589:443"
+    # Сайт публикуется через Traefik, порт на хост не пробрасывается.
+    # Раскомментируйте для прямого доступа в обход Traefik (отладка):
+#    ports:
+#      - "8588:80"
     volumes:
       - ./confs/nginx/:/etc/nginx/
-      - www_data:/opt/www/
+      - ./www/:/opt/www/
       - bxtemp_data:/opt/.bx_temp/
-      - ssl_data:/ssl/
     init: true
     cgroup: private
     security_opt:
@@ -228,60 +187,21 @@ services:
       dev:
         aliases:
           - nginx
-  push-sub:
-    image: quay.io/bitrix24/push:3.3-v1-alpine
-    container_name: dev_push_sub
-    restart: unless-stopped
-    env_file:
-      - .env
-      - .env_push
-      - .env_push_sub
-      - .env_redis
-#    ports:
-#      - "8010:8010"
-    init: true
-    cgroup: private
-    security_opt:
-      - no-new-privileges
-    cap_drop:
-      - ALL
-    tmpfs:
-      - /tmp:noexec,nodev,nosuid
-      - /var/tmp:noexec,nodev,nosuid
-      - /dev/shm:noexec,nodev,nosuid
-    networks:
-      dev:
-        aliases:
-          - push_sub
-    depends_on:
-      - redis
-  push-pub:
-    image: quay.io/bitrix24/push:3.3-v1-alpine
-    container_name: dev_push_pub
-    restart: unless-stopped
-    env_file:
-      - .env
-      - .env_push
-      - .env_push_pub
-      - .env_redis
-#    ports:
-#      - "9010:9010"
-    init: true
-    cgroup: private
-    security_opt:
-      - no-new-privileges
-    cap_drop:
-      - ALL
-    tmpfs:
-      - /tmp:noexec,nodev,nosuid
-      - /var/tmp:noexec,nodev,nosuid
-      - /dev/shm:noexec,nodev,nosuid
-    networks:
-      dev:
-        aliases:
-          - push_pub
-    depends_on:
-      - redis
+      proxy:
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-proxy}"
+      # HTTPS: основной роутер сайта
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}.rule=Host(`${SITE_DOMAIN}`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}.entrypoints=websecure"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}.tls.certresolver=${TRAEFIK_CERTRESOLVER:-le}"
+      - "traefik.http.services.${COMPOSE_PROJECT_NAME:-dev}.loadbalancer.server.port=80"
+      # HTTP: редирект на HTTPS
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}-http.rule=Host(`${SITE_DOMAIN}`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}-http.entrypoints=web"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}-http.middlewares=${COMPOSE_PROJECT_NAME:-dev}-https"
+      - "traefik.http.middlewares.${COMPOSE_PROJECT_NAME:-dev}-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.${COMPOSE_PROJECT_NAME:-dev}-https.redirectscheme.permanent=true"
   sphinx:
     image: quay.io/bitrix24/sphinx:2.2.11-v2-alpine
     container_name: dev_sphinx
@@ -326,7 +246,7 @@ services:
       #- ./confs/php83/etc/:/usr/local/etc/
       #- ./confs/php84/etc/:/usr/local/etc/
       #- ./confs/php85/etc/:/usr/local/etc/
-      - www_data:/opt/www/
+      - ./www/:/opt/www/
       - bxtemp_data:/opt/.bx_temp/
       - msmtp_data:/opt/msmtp/
       - browscap_data:/opt/browscap/
@@ -350,59 +270,3 @@ services:
           - cron
     depends_on:
       - php
-  ssl:
-    image: quay.io/bitrix24/ssl:1.2-v1-alpine
-    container_name: dev_ssl
-    restart: unless-stopped
-    env_file:
-      - .env
-      - .env_ssl
-    volumes:
-      - ssl_data:/ssl/
-    init: true
-    cgroup: private
-    security_opt:
-      - no-new-privileges
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - FOWNER
-      - SETUID
-      - SETGID
-    tmpfs:
-      - /tmp:noexec,nodev,nosuid
-      - /var/tmp:noexec,nodev,nosuid
-      - /dev/shm:noexec,nodev,nosuid
-    networks:
-      dev:
-        aliases:
-          - ssl
-    depends_on:
-      - nginx
-  lego:
-    image: quay.io/bitrix24/lego:4.35.2-v1-alpine
-    container_name: dev_lego
-    restart: unless-stopped
-    env_file:
-      - .env
-    ports:
-      - "80:80"
-    volumes:
-      - ssl_data:/ssl/
-    init: true
-    cgroup: private
-    security_opt:
-      - no-new-privileges
-    cap_drop:
-      - ALL
-    tmpfs:
-      - /tmp:noexec,nodev,nosuid
-      - /var/tmp:noexec,nodev,nosuid
-      - /dev/shm:noexec,nodev,nosuid
-    networks:
-      dev:
-        aliases:
-          - lego
-    depends_on:
-      - nginx

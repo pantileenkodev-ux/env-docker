@@ -1,804 +1,856 @@
 # Контейнерное окружение для Битрикс
 
-Проект представляет собой dev сайт, он же девелоперский сайт, предназначенный для тестирования, разработки, примера использования окружения на базе технологий [Docker](https://www.docker.com/). Проект поддерживается и развивается командой внутри компании 1С-Битрикс.
+Сборка для запуска сайта на продуктах 1С-Битрикс (`Управление сайтом`, `Битрикс24 Коробка`) в контейнерах [Docker](https://www.docker.com/).
 
-Программы, необходимые для работы технологий Битрикс, запускаются в контейнерах (`Docker Containers`). По шаблону из образов (`Docker Images`). Данные хранятся в томах (`Docker Volumes`). Связаны между собой посредством сети (`Docker Network`). И управляются (оркестрируются) используя compose (`Docker Compose`).
+Программы, необходимые для работы сайта, запускаются в контейнерах (`Docker Containers`) по шаблону из образов (`Docker Images`). Данные хранятся в томах (`Docker Volumes`). Контейнеры связаны между собой сетью (`Docker Network`) и управляются через `Docker Compose`.
+
+Документ построен как **пошаговая инструкция по переносу существующего сайта в эту сборку**: начинаем с резервных копий (файлы + база данных), заканчиваем настроенным и проверенным сайтом. Дальше идут разделы про установку сайта с нуля, регулярное резервное копирование и справочник по окружению.
 
 > [!CAUTION]
-> Внимание! Девелоперский сайт не рекомендуется для использования в "боевом" режиме (он же "продакшен"). Однако, это не запрещено.
+> Внимание! Порядок шагов важен. Не начинайте перенос, не имея на руках проверенных резервных копий файлов и базы данных исходного сайта.
+
+<a id="contents"></a>
+# Содержание
+
+* [Часть 1. Что нужно знать до старта](#part1)
+  * [Состав сборки](#stack)
+  * [Требования к хосту](#hostrequirements)
+  * [Как читать команды](#howtoreadcommands)
+* [Часть 2. Пошаговый перенос сайта](#part2)
+  * [Шаг 1. Резервная копия файлов сайта](#step1)
+  * [Шаг 2. Резервная копия базы данных](#step2)
+  * [Шаг 3. Проверка и перенос резервных копий](#step3)
+  * [Шаг 4. Docker и получение сборки на новом хосте](#step4)
+  * [Шаг 5. Настройка сборки до первого запуска](#step5)
+  * [Шаг 6. Первый запуск контейнеров](#step6)
+  * [Шаг 7. Загрузка файлов сайта в контейнер](#step7)
+  * [Шаг 8. Создание базы данных и импорт дампа](#step8)
+  * [Шаг 9. Подключение сайта к базе данных](#step9)
+  * [Шаг 10. Очистка кеша и настроек старого окружения](#step10)
+  * [Шаг 11. Первое открытие сайта и проверка](#step11)
+  * [Шаг 12. Настройки модулей, лицензия и обновления](#step12)
+  * [Шаг 13. Cron и агенты](#step13)
+  * [Шаг 14. Временные файлы вне корня сайта](#step14)
+  * [Шаг 15. Почта](#step15)
+  * [Шаг 16. Кеш и сессии в memcached или redis](#step16)
+  * [Шаг 17. Поиск через Sphinx](#step17)
+  * [Шаг 18. Финальный чек-лист](#step18)
+* [Часть 3. Установка сайта с нуля](#part3)
+  * [BitrixSetup / Restore](#bitrixsetupphprestorephp)
+  * [Установка дистрибутива](#installdistro)
+  * [Восстановление из резервной копии Битрикс](#restorebackup)
+* [Часть 4. Регулярное резервное копирование](#part4)
+  * [Бекап средствами Битрикс по cron](#backupbybitrix)
+  * [Дамп базы данных с хоста](#backupmysqldump)
+  * [Резервная копия томов Docker](#backupvolumes)
+  * [Проверка восстановления](#backuprestoretest)
+* [Часть 5. Справочник по окружению](#part5)
+  * [Управление контейнерами](#management)
+  * [Публикация через Traefik](#traefik)
+  * [Работа с файлами сайта из папки](#worksitefolder)
+  * [Консоль сервисов](#servicesconsole)
+  * [PHP](#php)
+  * [Nginx](#nginx)
+  * [Проверка системы и тест производительности](#sitecheckerandperfmon)
+  * [Версии ПО](#softwareversions)
+  * [Кастомизация](#customization)
+  * [Сборка или скачивание Docker образов](#dockerimages)
+  * [Особенности ОС, сертифицированных ФСТЭК](#fstkos)
+* [Часть 6. Диагностика типовых проблем](#part6)
+
+<a id="part1"></a>
+# Часть 1. Что нужно знать до старта
+
+<a id="stack"></a>
+## Состав сборки
+
+Файл `docker-compose.yml` описывает сеть `dev` (подсеть `10.10.10.0/24`), тома и семь сервисов:
+
+| Сервис | Контейнер | Образ | Назначение |
+|---|---|---|---|
+| `nginx` | `dev_nginx` | `quay.io/bitrix24/nginx:1.30.4-v1-alpine` | веб-сервер, публикуется наружу через Traefik |
+| `php` | `dev_php` | `quay.io/bitrix24/php:8.2.32-fpm-v1-alpine` | PHP-FPM, обработка кода сайта |
+| `cron` | `dev_cron` | `quay.io/bitrix24/php:8.2.32-fpm-v1-alpine` | периодические задания, агенты Битрикс |
+| `mysql` | `dev_mysql` | `quay.io/bitrix24/percona-server:8.0.46-v1-rhel` | база данных |
+| `memcached` | `dev_memcached` | `memcached:1.6.45-alpine` | кеш и/или сессии |
+| `redis` | `dev_redis` | `redis:8.2.7-alpine` | кеш и/или сессии |
+| `sphinx` | `dev_sphinx` | `quay.io/bitrix24/sphinx:2.2.11-v2-alpine` | полнотекстовый поиск |
+
+**Файлы сайта лежат в каталоге `www/` репозитория** и подключены в контейнеры `php`, `cron` и `nginx` как `/opt/www` (bind mount). С ними можно работать напрямую с хоста - редактором, IDE, git - без захода в контейнер. Подробности и права доступа - в разделе [Работа с файлами сайта из папки](#worksitefolder).
+
+Остальные данные лежат в именованных томах Docker (префикс тома - значение `COMPOSE_PROJECT_NAME` из файла `.env`, по умолчанию `dev`):
+
+| Том | Точка монтирования | Что хранит |
+|---|---|---|
+| `dev_mysql_lib_data` | `/var/lib/mysql` в `mysql` | файлы базы данных |
+| `dev_mysql_log_data` | `/var/log/mysql` в `mysql` | логи базы данных |
+| `dev_bxtemp_data` | `/opt/.bx_temp` в `php`, `cron`, `nginx` | временные файлы Битрикс вне корня сайта |
+| `dev_msmtp_data` | `/opt/msmtp` в `php`, `cron` | настройки отправки почты (`.msmtprc`) |
+| `dev_browscap_data` | `/opt/browscap` в `php`, `cron` | база Browser Capabilities |
+| `dev_geoip2_data` | `/opt/geoip2` в `php`, `cron` | базы GeoIP2 (`*.mmdb`) |
+| `dev_redis_data` | `/data` в `redis` | дампы redis |
+
+> [!CAUTION]
+> Внимание! База данных живет в томе Docker, а не в каталоге репозитория. Команда `docker compose down -v` удаляет тома вместе с базой (файлы сайта в каталоге `www/` при этом останутся). Для остановки используйте `docker compose stop`.
+
+Конфигурационные файлы подключаются с хоста из каталога `confs/` и переживают пересоздание контейнеров:
+
+```bash
+www/                 -> /opt/www/              (контейнеры php, cron, nginx) - корень сайта
+confs/nginx/         -> /etc/nginx/            (контейнер nginx)
+confs/php82/etc/     -> /usr/local/etc/        (контейнеры php и cron)
+confs/redis/redis.conf   -> /usr/local/etc/redis/redis.conf
+confs/sphinx/sphinx.conf -> /opt/sphinx/conf/sphinx.conf
+confs/mysql/         -> конфигурация базы, зашита в образ bitrix24/percona-server
+```
+
+Переменные окружения хранятся в файлах:
+
+```bash
+.env       - имя проекта, часовой пояс и параметры Traefik, подключен ко всем сервисам
+.env_sql   - пароль root базы MySQL, подключен к сервису mysql
+.env_php   - версия и тип окружения VMBitrix, подключен к сервисам php и cron
+.env_redis - шаблон пароля redis, в текущей сборке ни к одному сервису не подключен (см. Шаг 5)
+```
+
+Содержимое `.env`:
+
+```bash
+COMPOSE_PROJECT_NAME=dev        # префикс имен контейнеров и томов
+TZ=Europe/Moscow                # часовой пояс контейнеров
+SITE_DOMAIN=dev.example.com     # домен сайта для роутера Traefik
+TRAEFIK_NETWORK=proxy           # имя внешней сети, в которой работает Traefik
+TRAEFIK_CERTRESOLVER=le         # имя certresolver-а из конфигурации Traefik
+```
+
+> [!IMPORTANT]
+> Сайт публикуется наружу **через Traefik**: у сервиса `nginx` нет проброшенного порта, он подключен к внешней сети Traefik и размечен labels. Настройка - в [Шаге 5](#step5), разбор схемы - в разделе [Публикация через Traefik](#traefik).
 >
-> Стоит учесть, что такая эксплуатация требует дополнительных настроек безопасности контейнерного окружения, хоста и самого сайта.
+> В этой сборке нет сервисов `postgres`, `push` (pub/sub), `ssl` и `lego`, а в `confs/nginx/conf.d/default.conf` оставлены только HTTP-серверы (порты `80` и `8893`) - TLS терминирует Traefik. Если нужны PostgreSQL, push-сервер или встроенный выпуск SSL-сертификатов - их конфигурации есть в истории git этого репозитория.
 
-# Содержимое
+<a id="hostrequirements"></a>
+## Требования к хосту
 
-* [Docker и Docker Compose](#docker)
-* [docker-compose.yml](#dockercomposeyml)
-* [Пароли к базам данных MySQL и PostgreSQL](#databasespasswords)
-* [Пароль для Redis](#redispassword)
-* [Секретный ключ для Push-сервера](#pushserversecretkey)
-* [Часовой пояс (timezone)](#timezone)
-* [Управление](#management)
-* [Адресация](#iporurls)
-* [Порты](#ports)
-* [Доступ к сайту](#siteaccess)
-* [Базовая проверка конфигурации окружения](#bitrixservertestphp)
-* [BitrixSetup / Restore](#bitrixsetupphprestorephp)
-  * [Установка дистрибутивов](#installdistro)
-  * [Восстановление из резервной копии](#restorebackup)
-* [Лицензия, обновления платформы и решений](#licenceandupdates)
-* [Настройки модулей](#modulessettings)
-* [Проверка системы](#sitechecker)
-* [Тест производительности](#perfmonpanel)
-* [Cron](#cron)
-  * [Выполнение агентов на cron](#agentsoncron)
-  * [Кастомные cron задания](#owncrontasks)
-* [Хранение временных файлов вне корневой директории сайта](#bxtemporaryfilesdirectory)
-* [Push & pull](#pushpull)
-  * [Push-сервер](#pushserver)
-* [Sphinx](#sphinx)
-  * [Поиск с помощью Sphinx](#sphinxsearch)
-* [Почта](#email)
-  * [Отправка почты с помощью msmtp](#msmtpmta)
-  * [Отправка почты через SMTP-сервера отправителя](#emailsmtpmailer)
-  * [Логирование отправки почты в файл](#emaildebuglog)
-* [PHP](#php)
-  * [Composer](#phpcomposer)
-  * [Browser Capabilities](#phpbrowsercapabilities)
-  * [GeoIP2](#phpgeoip2)
-  * [Расширения (extensions)](#phpextensions)
-  * [Imagick Engine для изображений](#phpimagickimageengine)
-  * [security: Веб-антивирус](#phpsecurityantivirus)
-  * [Роутинг](#phprouting)
-    * [Включение роутинга до запуска сайта](#phproutingbeforestart)
-    * [Включение или отключение роутинга для запущенного сайта](#phproutingafterstart)
-* [Nginx](#nginx)
-  * [Модули для Nginx](#nginxmodules)
-  * [Подключение или отключение модуля для Nginx](#nginxmoduleonoroff)
-* [Memcache и Redis](#memcacheandredis)
-  * [Memcache](#memcache)
-  * [Redis](#redis)
-  * [Кеширование](#cachestorage)
-  * [Хранение сессий](#sessionstorage)
-  * [Кеширование с помощью модуля Веб-кластер](#clustercachestorage)
-    * [Memcache](#clustercachememcache)
-    * [Redis](#clustercacheredis)
-* [HTTPS/SSL/TLS/WSS](#httpsssltlswss)
-  * [Самоподписанный сертификат](#selfsignedcerts)
-    * [Выпуск сертификатов](#selfsigneddeploys)
-    * [Доверие к сертификатам центров сертификации для PHP и Nginx](#selfsignedtrustforphpandnginx)
-    * [Установка сертификатов](#installselfsignedcerts)
-    * [Импорт сертификатов в ОС или браузер](#importselfsignedcertstoosorbrowser)
-    * [Удаление сертификатов из ОС или браузера](#removeselfsignedcertsfromosorbrowser)
-  * [Бесплатный Lets Encrypt сертификат](#presentcerts)
-    * [Lego](#lego)
-    * [Перенаправление или перенос домена](#domaintransfer)
-    * [Челленджи](#letsencryptchallenges)
-      * [HTTP челлендж (http-01)](#letsencrypthttpchallenge)
-      * [DNS челлендж (dns-01)](#letsencryptdnschallenge)
-    * [Команды lego](#legocommands)
-      * [Команда для HTTP челленджа (http-01)](#legocommandhttpchallenge)
-      * [Команда для DNS челленджа (dns-01)](#legocommanddnschallenge)
-    * [Выпуск сертификатов](#legodeploys)
-      * [HTTP челлендж (http-01) для одного домена (singledomain SSL-сертификат)](#httpchallengesingledomain)
-      * [HTTP челлендж (http-01) для множества поддоменов домена (multidomain SSL-сертификат)](#httpchallengemultidomain)
-      * [DNS челлендж (dns-01) для одного домена (singledomain SSL-сертификат)](#dnschallengesingledomain)
-      * [DNS челлендж (dns-01) для множества поддоменов домена (multidomain SSL-сертификат)](#dnschallengemultidomain)
-      * [DNS челлендж (dns-01) на все множество поддоменных имен домена (wildcard SSL-сертификат)](#dnschallengewildcard)
-    * [Установка сертификатов](#installpresentcerts)
-* [Консоль сервисов](#servicesconsole)
-  * [Контейнер](#containerconsole)
-  * [MySQL](#mysqlconsole)
-  * [PostgreSQL](#postgresqlconsole)
-  * [Memcache](#memcacheconsole)
-  * [Redis](#redisconsole)
-* [Кастомизация](#customization)
-* [Версии ПО](#softwareversions)
-  * [Текущие версии](#currentversions)
-  * [Альтернативные версии](#alternativeversions)
-    * [Redis](#redisalternativeversions)
-    * [PostgreSQL](#postgresqlalternativeversions)
-    * [MySQL](#mysqlalternativeversions)
-    * [PHP и Cron](#phpandcronalternativeversions)
-* [Сборка или скачивание Docker образов](#dockerimages)
-  * [Базовые образы](#basicimages)
-  * [Битрикс образы](#bitriximages)
-  * [Модули для Nginx](#nginxmodulesimage)
-* [Особенности операционных систем сертифицированных ФСТЭК](#fstkos)
-  * [Альт 10 СП](#alt10sp)
-  * [Astra Linux Special Edition 1.8](#astralinuxspecialedition18)
+- `Docker` и `Docker Compose` v2 (проверка: `docker version` и `docker compose version`);
+- свободное место: **размер файлов сайта + размер базы + запас минимум ×2** на время распаковки и импорта дампа;
+- оперативная память: минимум 4 ГБ, комфортно от 8 ГБ (`innodb_buffer_pool_size` по умолчанию `1024M`, `maxmemory` redis - `942mb`);
+- запущенный Traefik и внешняя сеть Docker, к которой он подключен (по умолчанию `proxy`); порты `80/tcp` и `443/tcp` на фаерволе открывает и слушает сам Traefik.
 
-<a id="docker"></a>
-# Docker и Docker Compose
-
-Для запуска проекта понадобится `Docker`. Для оркестровки и управления `Docker Compose`.
-
-Способ развертывания зависит от вашей операционной системы, используемой на хосте.
-
-Возможны варианты:
-- рабочая станция, персональный компьютер, ноутбук и т.д. с рабочим столом и графической средой, он же desktop
-- сервер, без графической среды, но с консолью или удаленным доступом, он же server
-
-Для взаимодействия с `Docker` в графическом режиме будем использовать продукт [Docker Desktop](https://docs.docker.com/desktop/), который возможно запустить на ОС `Windows`, `Linux`, `MacOS`.
-
-Ознакомьтесь с документацией и разверните `Docker` в зависимости от используемой вами ОС:
+Установка Docker зависит от ОС хоста:
 - `Docker Desktop on Windows`: https://docs.docker.com/desktop/setup/install/windows-install/
-- `Docker Desktop on Linux`: https://docs.docker.com/desktop/setup/install/linux/
 - `Docker Desktop on Mac`: https://docs.docker.com/desktop/setup/install/mac-install/
+- `Docker Desktop on Linux`: https://docs.docker.com/desktop/setup/install/linux/
+- `Docker Engine` (сервер без графической среды): https://docs.docker.com/engine/install/
+- `Docker Compose` (если требуется отдельно): https://docs.docker.com/compose/
 
-Для взаимодействия с `Docker` в режиме командной строки (без графической среды) будем использовать продукт [Docker Engine](https://docs.docker.com/engine/), который возможно запустить на ОС `Linux`.
+Для ОС, сертифицированных ФСТЭК, смотрите раздел [Особенности ОС, сертифицированных ФСТЭК](#fstkos).
 
-Ознакомьтесь с документацией и разверните `Docker Engine` в зависимости от используемой вами ОС `Linux`:
-- `Docker Engine`: https://docs.docker.com/engine/install/
+<a id="howtoreadcommands"></a>
+## Как читать команды
 
-В современных версиях продуктов `Docker` обычно в их состав уже включен `Docker Compose`.
+Команды в инструкции разделены на два типа:
 
-Ознакомьтесь с документацией и разверните `Docker Compose`, если это требуется отдельно:
-- `Docker Compose`: https://docs.docker.com/compose/
+1. **На исходном сервере** (откуда переносим сайт) - обычный `bash` Linux-сервера.
+2. **На новом хосте** (где поднимаем сборку) - команды `docker compose`, выполняются **из каталога репозитория**, рядом с файлом `docker-compose.yml`.
 
-<a id="dockercomposeyml"></a>
-# docker-compose.yml
+Команды `docker compose ***` одинаковы в `bash` и в `PowerShell`. Отличается только запись путей и переменных: в примерах для Windows используется `.\file.tar.gz`, для Linux/macOS - `./file.tar.gz`.
 
-Проект в своем составе в репозитории содержит файл `docker-compose.yml`. В нем описывается способ взаимодействия с томами (volumes), сервисами (services), сетями (networks) Docker.
-
-Команды `docker compose ***`, приведенные в этом файле, будут использовать по умочанию файл `docker-compose.yml`. Полный вид команды с указанием файла выглядит как `docker compose -f docker-compose.yml ***`.
-
-Так же можно создать отдельный файл `docker-compose-test.yml`, разместить код внутри файла (описать тома, сервисы, сеть и прочее), убрать лишнее и т.д.
-
-Тогда во всех командах указываем отдельный `.yml` файл через опцию `-f`, пример:
-```bash
-docker compose -f docker-compose-test.yml ps
-```
-
-<a id="databasespasswords"></a>
-# Пароли к базам данных MySQL и PostgreSQL
+Конструкции с конвейером (`|`), подстановкой (`$(...)`) и `zcat`/`gunzip` в `PowerShell` не работают. Поэтому во всех шагах, где такие конструкции нужны, команда выполняется **внутри контейнера** - это работает одинаково на всех ОС.
 
 > [!CAUTION]
-> Внимание! Перед первым запуском обязательно придумайте или сгенерируйте ваши уникальные пароли суперпользователей баз данных `MySQL` и `PostgreSQL`.
+> Внимание! При использовании ОС ALT 10.x или ALT 11.x compose поставляется отдельным исполняемым файлом, команды нужно писать через тире: `docker-compose ***`.
 
-Для этого используем образ `Alpine Linux`:
+<a id="part2"></a>
+# Часть 2. Пошаговый перенос сайта
+
+Шаги 1-3 выполняются на исходном сервере, шаги 4-18 - на новом хосте со сборкой.
+
+<a id="step1"></a>
+## Шаг 1. Резервная копия файлов сайта
+
+Работаем на исходном сервере. Определяем корень сайта (для BitrixVM это обычно `/home/bitrix/www`) и его размер:
+
 ```bash
-docker pull alpine:3.23
+du -sh /home/bitrix/www
+df -h
 ```
 
-Генерируем уникальный пароль для суперпользователя `root` базы данных `MySQL` с помощью команды:
+Убеждаемся, что свободного места хватает для архива (в среднем архив занимает 40-70% от размера каталога).
+
+Создаем каталог для резервных копий:
+
 ```bash
-docker container run --rm --name mysql_password_generate alpine:3.23 sh -c "(cat /dev/urandom | tr -dc A-Za-z0-9\?\!\@\-\_\+\%\(\)\{\}\[\]\= | head -c 16) | tr -d '\' | tr -d '^' && echo ''"
+mkdir -p /root/backup
 ```
 
-Генерируем уникальный пароль для суперпользователя `postgres` базы данных `PostgreSQL` с помощью команды:
+Архивируем файлы сайта, исключая кеш и временные каталоги - они не переносятся и только раздувают архив:
+
 ```bash
-docker container run --rm --name postgresql_password_generate alpine:3.23 sh -c "(cat /dev/urandom | tr -dc A-Za-z0-9\?\!\@\-\_\+\%\(\)\{\}\[\]\= | head -c 16) | tr -d '\' | tr -d '^' && echo ''"
+cd /home/bitrix/www
+tar -czf /root/backup/www_$(date +%Y%m%d).tar.gz \
+  --exclude='./bitrix/backup/*' \
+  --exclude='./bitrix/cache/*' \
+  --exclude='./bitrix/managed_cache/*' \
+  --exclude='./bitrix/stack_cache/*' \
+  --exclude='./bitrix/html_pages/*' \
+  --exclude='./bitrix/tmp/*' \
+  --exclude='./upload/resize_cache/*' \
+  --exclude='./upload/tmp/*' \
+  .
 ```
 
-Шаблон пароля для суперпользователя `root` базы данных `MySQL` (`CHANGE_MYSQL_ROOT_PASSWORD_HERE`) и шаблон пароля для суперпользователя `postgres` базы данных `PostgreSQL` (`CHANGE_POSTGRESQL_POSTGRES_PASSWORD_HERE`) хранятся в файле `.env_sql` в виде:
+> [!IMPORTANT]
+> Каталог `upload` (без `resize_cache` и `tmp`) исключать <b>нельзя</b> - это файлы пользователей сайта.
+>
+> Файлы `bitrix/.settings.php`, `bitrix/php_interface/dbconn.php` и `bitrix/license_key.php` тоже должны попасть в архив: из них берутся текущие настройки, которые мы будем править на шаге 9.
+
+Проверяем архив и запоминаем его контрольную сумму:
+
 ```bash
-MYSQL_ROOT_PASSWORD="CHANGE_MYSQL_ROOT_PASSWORD_HERE"
-POSTGRES_PASSWORD="CHANGE_POSTGRESQL_POSTGRES_PASSWORD_HERE"
+tar -tzf /root/backup/www_*.tar.gz > /dev/null && echo "archive OK"
+ls -lh /root/backup/
+sha256sum /root/backup/www_*.tar.gz
 ```
 
-Обязательно измените значения в файле `.env_sql`, заменив шаблоны `CHANGE_MYSQL_ROOT_PASSWORD_HERE` и `CHANGE_POSTGRESQL_POSTGRES_PASSWORD_HERE` на ваши значения.
+Заодно сохраняем список версий исходного окружения - пригодится при выборе версий контейнеров на шаге 5:
 
-<a id="redispassword"></a>
-# Пароль для Redis
+```bash
+php -v
+mysql --version
+nginx -v
+```
 
-По умолчанию контейнер `redis` работает в режиме "без пароля".
+<a id="step2"></a>
+## Шаг 2. Резервная копия базы данных
 
-Однако, для усиления безопасности нужно использовать контейнер `redis`в режиме "обязательно с паролем".
+Продолжаем работать на исходном сервере.
+
+**2.1. Узнаем параметры подключения к базе.** Они лежат в файле `bitrix/php_interface/dbconn.php` и/или в `bitrix/.settings.php`:
+
+```bash
+grep -E "DBHost|DBName|DBLogin|DBPassword" /home/bitrix/www/bitrix/php_interface/dbconn.php
+```
+
+```bash
+php -r '$c = include "/home/bitrix/www/bitrix/.settings.php"; print_r($c["connections"]["value"]["default"]);'
+```
+
+Записываем: хост, имя базы, логин, пароль. Имя базы у продуктов Битрикс чаще всего `sitemanager`.
+
+**2.2. Смотрим размер базы, кодировку и типы таблиц:**
+
+```bash
+mysql -u root -p -e "
+SELECT table_schema, ROUND(SUM(data_length+index_length)/1024/1024) AS size_mb, COUNT(*) AS tables
+FROM information_schema.tables WHERE table_schema='sitemanager' GROUP BY table_schema;
+SELECT engine, COUNT(*) FROM information_schema.tables WHERE table_schema='sitemanager' GROUP BY engine;
+SHOW CREATE DATABASE sitemanager;"
+```
+
+Запоминаем три вещи:
+- **количество таблиц** - по нему будем проверять полноту импорта на шаге 8;
+- **кодировку и сравнение (collation) базы** из `SHOW CREATE DATABASE` - с ними будем создавать базу на новом хосте;
+- **типы таблиц (engine)** - если есть таблицы `MyISAM`, читаем предупреждение ниже.
+
+**2.3. Снимаем дамп.**
+
+Для базы целиком на `InnoDB` (обычный случай) дамп снимается без блокировки сайта:
+
+```bash
+mkdir -p /root/backup
+mysqldump -u root -p \
+  --single-transaction --quick --hex-blob \
+  --routines --triggers --events \
+  --default-character-set=utf8mb4 \
+  --set-gtid-purged=OFF --no-tablespaces \
+  sitemanager | gzip -1 > /root/backup/db_$(date +%Y%m%d).sql.gz
+```
+
+Пояснения к опциям:
+- `--single-transaction` - согласованный снимок без блокировки таблиц `InnoDB`;
+- `--quick` - выгрузка построчно, без загрузки таблицы в память целиком;
+- `--hex-blob` - корректный перенос двоичных полей;
+- `--routines --triggers --events` - процедуры, триггеры и события базы;
+- `--set-gtid-purged=OFF` - убирает из дампа GTID-метки исходного сервера (в MariaDB такой опции нет, уберите ее);
+- `--no-tablespaces` - нужна для MySQL 5.7.31+/8.x, если у пользователя нет привилегии `PROCESS`.
 
 > [!CAUTION]
-> Внимание! Перед первым запуском обязательно придумайте или сгенерируйте ваш уникальный пароль для `Redis`, если необходимо использовать пароль для этого сервиса.
+> Внимание! Если в базе есть таблицы `MyISAM`, опция `--single-transaction` не гарантирует их целостность.
+>
+> В этом случае либо переводим сайт в режим технических работ и снимаем дамп с `--lock-all-tables`, либо предварительно конвертируем таблицы в `InnoDB`.
 
-Для этого используем образ `Alpine Linux`:
+Если дамп снимается со старого сервера более новым клиентом `mysqldump` 8.x, добавьте `--column-statistics=0`.
+
+**2.4. Проверяем дамп.** У корректного дампа последняя строка содержит `Dump completed`:
+
 ```bash
-docker pull alpine:3.23
+zcat /root/backup/db_*.sql.gz | tail -1
+zcat /root/backup/db_*.sql.gz | grep -c "^CREATE TABLE"
+ls -lh /root/backup/
+sha256sum /root/backup/db_*.sql.gz
 ```
 
-Генерируем уникальный пароль для `Redis` с помощью команды:
-```bash
-docker container run --rm --name redis_password_generate alpine:3.23 sh -c "(cat /dev/urandom | tr -dc A-Za-z0-9\.\,\?\!\@\$\-\+\=\(\)\{\}\[\] | head -c 16) | tr -d '\' | tr -d '^' && echo ''"
-```
-
-Шаблон пароля для сервиса `Redis` (`CHANGE_REDIS_PASSWORD_HERE`) хранится:
-
-- в файле `confs/redis/redis.conf` в виде:
-```bash
-#requirepass CHANGE_REDIS_PASSWORD_HERE
-```
-
-- в файле `.env_redis` в виде:
-```bash
-#REDIS_PASSWORD="CHANGE_REDIS_PASSWORD_HERE"
-```
-
-Обязательно измените значения в файлах `confs/redis/redis.conf` и `.env_redis`, заменив шаблон `CHANGE_REDIS_PASSWORD_HERE` на ваше значение в обоих файлах.
-
-Например, для установки пароля `AbCdEfGh@159!753` контейнера `redis`:
-
-- в файле `confs/redis/redis.conf` убираем `#` в строке с `requirepass`, меняем пароль в шаблоне `CHANGE_REDIS_PASSWORD_HERE`, итог:
-```bash
-requirepass AbCdEfGh@159!753
-```
-
-- в файле `.env_redis` к первой строке `REDIS_PASSWORD=""` добавляем `#`, во второй строке убираем `#` и меняем пароль в шаблоне `CHANGE_REDIS_PASSWORD_HERE`, итог:
-```bash
-#REDIS_PASSWORD=""
-REDIS_PASSWORD="AbCdEfGh@159!753"
-```
-
-<a id="pushserversecretkey"></a>
-# Секретный ключ для Push-сервера
+Количество `CREATE TABLE` должно совпадать с количеством таблиц из пункта 2.2.
 
 > [!CAUTION]
-> Внимание! Перед первым запуском обязательно придумайте или сгенерируйте ваш уникальный секретный ключ для Push-сервера.
+> Внимание! Дамп, у которого нет строки `Dump completed`, обрезан. Переносить такой дамп нельзя - снимите его заново.
 
-Для этого используем образ `Alpine Linux`:
+<a id="step3"></a>
+## Шаг 3. Проверка и перенос резервных копий
+
+На руках должно быть два файла:
+
 ```bash
-docker pull alpine:3.23
+www_YYYYMMDD.tar.gz  - файлы сайта
+db_YYYYMMDD.sql.gz   - дамп базы данных
 ```
 
-Генерируем уникальный секретный ключ с помощью команды:
+Копируем их на новый хост, например по `scp` (выполняется на новом хосте):
+
 ```bash
-docker container run --rm --name push_server_key_generate alpine:3.23 sh -c "(cat /dev/urandom | tr -dc A-Za-z0-9 | head -c 128) && echo ''"
+scp root@old-server:/root/backup/www_*.tar.gz .
+scp root@old-server:/root/backup/db_*.sql.gz .
 ```
 
-Шаблон секретного ключа (`CHANGE_SECURITY_KEY_HERE`) для подписи соединения между клиентом и Push-сервером хранится в файле `.env_push` в виде:
+Для Windows подойдет `scp` из состава OpenSSH или любой SFTP-клиент.
+
+После копирования **обязательно** сверяем контрольные суммы с теми, что получили на шагах 1 и 2:
+
+- Linux/macOS:
 ```bash
-PUSH_SECURITY_KEY=CHANGE_SECURITY_KEY_HERE
+sha256sum www_*.tar.gz db_*.sql.gz
 ```
-Обязательно измените значение вашего уникального секретного ключа в файле `.env_push`, заменив шаблон `CHANGE_SECURITY_KEY_HERE` на ваше значение.
 
-<a id="timezone"></a>
-# Часовой пояс (timezone)
+- Windows PowerShell:
+```powershell
+Get-FileHash .\www_*.tar.gz, .\db_*.sql.gz -Algorithm SHA256
+```
 
-Значение часового пояса (timezone), используемой контейнерами, хранится в файле `.env`.
+Суммы совпали - идем дальше. Не совпали - копируем файлы заново.
 
-Значение по умолчанию задано как:
+<a id="step4"></a>
+## Шаг 4. Docker и получение сборки на новом хосте
+
+Устанавливаем `Docker` и `Docker Compose` по документации для вашей ОС (ссылки в разделе [Требования к хосту](#hostrequirements)) и проверяем:
+
 ```bash
+docker version
+docker compose version
+```
+
+Получаем сборку и переходим в ее каталог:
+
+```bash
+git clone <URL репозитория> env-docker
+cd env-docker
+```
+
+Все дальнейшие команды `docker compose` выполняются из этого каталога.
+
+Предварительно скачиваем образы (необязательно, но так первый запуск пройдет быстрее):
+
+```bash
+docker compose pull
+```
+
+<a id="step5"></a>
+## Шаг 5. Настройка сборки до первого запуска
+
+> [!CAUTION]
+> Внимание! Все правки этого шага делаются <b>до</b> первого запуска контейнеров. Пароль базы данных после создания тома `dev_mysql_lib_data` меняется уже средствами MySQL, а не через файл `.env_sql`.
+
+**5.1. Имя проекта и часовой пояс.** Файл `.env`:
+
+```bash
+COMPOSE_PROJECT_NAME=dev
 TZ=Europe/Moscow
 ```
 
-Исключение составляет контейнер с `php`, значение часового пояса (timezone) которого продублировано в отдельном файле `confs/phpXXX/etc/php/conf.d/timezone.ini` как:
+`COMPOSE_PROJECT_NAME` задает префикс имен контейнеров (`dev_nginx`, `dev_mysql`, ...) и томов (`dev_www_data`, ...). Меняйте его, если на одном хосте будет несколько сайтов на этой сборке.
+
+Часовой пояс дублируется для PHP в файле `confs/php82/etc/php/conf.d/timezone.ini`:
+
 ```bash
 date.timezone = Europe/Moscow
 ```
 
-Где `XXX` в пути к файлу `timezone.ini` - версия `php`. По умолчанию равна `82`, возможные [альтернативные варианты](#phpandcronalternativeversions) `83`, `84` и `85`.
+Значения в обоих файлах должны совпадать. Если на шаге 5.4 выбрана другая версия PHP, правится файл соответствующего каталога `confs/php83`, `confs/php84` или `confs/php85`.
 
-При необходимости смените значение в обоих файлах до создания и запуска контейнеров проекта. Например, для версии php `8.2.x` и часового пояса `Europe/Kaliningrad` измените значение:
+**5.2. Пароль root для MySQL.** Генерируем уникальный пароль:
 
-- в файле `.env`:
 ```bash
-TZ=Europe/Kaliningrad
+docker pull alpine:3.23
+docker container run --rm --name mysql_password_generate alpine:3.23 sh -c "(cat /dev/urandom | tr -dc A-Za-z0-9\?\!\@\-\_\+\%\(\)\{\}\[\]\= | head -c 16) | tr -d '\' | tr -d '^' && echo ''"
 ```
 
-- в файле `confs/php82/etc/php/conf.d/timezone.ini`:
+В файле `.env_sql` заменяем шаблон `CHANGE_MYSQL_ROOT_PASSWORD_HERE` на полученное значение:
+
 ```bash
-date.timezone = Europe/Kaliningrad
+MYSQL_ROOT_PASSWORD="ваш_пароль"
 ```
 
-<a id="management"></a>
-# Управление
+Сохраняем пароль в менеджере паролей - он понадобится на шаге 8 и при любом обслуживании базы.
 
-Управление (или оркестровка) набором контейнеров или одним из контейнеров осуществляется через `Docker Compose`.
+**5.3. Пароль Redis (по желанию).** По умолчанию `redis` работает без пароля и доступен только внутри сети `dev` (порт наружу не проброшен). Если пароль все же нужен, генерируем его:
 
-Переходим в каталог проекта `cd env-docker` и выполняем команды ниже.
+```bash
+docker container run --rm --name redis_password_generate alpine:3.23 sh -c "(cat /dev/urandom | tr -dc A-Za-z0-9\.\,\?\!\@\$\-\+\=\(\)\{\}\[\] | head -c 16) | tr -d '\' | tr -d '^' && echo ''"
+```
 
-Запустить все контейнеры и оставить их работать в фоне:
+В файле `confs/redis/redis.conf` убираем `#` в первой строке и подставляем пароль:
+
+```bash
+requirepass ваш_пароль
+```
+
+Этот же пароль позже указывается в блоках `cache`/`session` файла `/bitrix/.settings.php` (см. [Шаг 16](#step16)).
+
+> [!NOTE]
+> Файл `.env_redis` в текущей сборке не подключен ни к одному сервису (он использовался push-сервером). Пароль redis задается только в `confs/redis/redis.conf`.
+
+**5.4. Версии PHP и MySQL.** По умолчанию: PHP `8.2.32`, Percona Server `8.0.46`. Доступны PHP `8.3.x`, `8.4.x`, `8.5.x` и Percona Server `8.4.x`. Переключение - комментированием строк в `docker-compose.yml`, подробности в разделе [Версии ПО](#softwareversions).
+
+Ориентируйтесь на версии исходного сервера (собранные на шаге 1) и на требования вашей версии продукта: переносить сайт лучше на ту же или соседнюю версию PHP, а обновляться уже после успешного переезда.
+
+**5.5. Публикация сайта через Traefik.** Порт наружу сборка не пробрасывает - запросы к сайту приходят из Traefik по внутренней сети.
+
+В файле `.env` указываем домен сайта, имя внешней сети Traefik и имя certresolver-а:
+
+```bash
+SITE_DOMAIN=site.example.com
+TRAEFIK_NETWORK=proxy
+TRAEFIK_CERTRESOLVER=le
+```
+
+Убеждаемся, что внешняя сеть существует и Traefik подключен к ней:
+
+```bash
+docker network ls | grep proxy
+```
+
+Если сети нет, создаем ее и подключаем к ней Traefik:
+
+```bash
+docker network create proxy
+```
+
+Проверяем, что домен из `SITE_DOMAIN` указывает A-записью на IP хоста с Traefik - иначе выпуск сертификата не пройдет.
+
+Подробный разбор labels, требований к Traefik и типовых ошибок - в разделе [Публикация через Traefik](#traefik).
+
+> [!NOTE]
+> Если Traefik пока нет, а сайт нужно открыть напрямую, раскомментируйте в `docker-compose.yml` у сервиса `nginx` блок:
+> ```yaml
+>     ports:
+>       - "8588:80"
+> ```
+> и откройте порт на фаерволе: `ufw allow 8588` или `firewall-cmd --add-port=8588/tcp --permanent && firewall-cmd --reload`.
+
+**5.6. Параметры MySQL под размер вашей базы.** Файл `confs/mysql/etc/my.cnf.d/my.cnf`, значения по умолчанию:
+
+```bash
+max_allowed_packet = 16M
+innodb_buffer_pool_size = 1024M
+max_connections = 43
+```
+
+Если база больше 2-3 ГБ или в ней есть крупные двоичные поля, до первого запуска увеличиваем:
+
+```bash
+max_allowed_packet = 128M
+innodb_buffer_pool_size = 2048M
+```
+
+`innodb_buffer_pool_size` разумно держать в пределах 50-70% доступной хосту памяти. Слишком маленький `max_allowed_packet` - самая частая причина обрыва импорта дампа на шаге 8.
+
+<a id="step6"></a>
+## Шаг 6. Первый запуск контейнеров
+
+Запускаем все контейнеры в фоне:
+
 ```bash
 docker compose up -d
 ```
 
-Отобразить список контейнеров и их статус:
+Проверяем статус - все сервисы должны быть в состоянии `Up`/`running`:
+
 ```bash
 docker compose ps
 ```
 
-Показать логи сразу всех контейнеров:
+Смотрим логи, ошибок быть не должно:
+
 ```bash
-docker compose logs
+docker compose logs --tail=50
 ```
 
-Показать лог определенного сервиса-контейнера:
+Отдельно убеждаемся, что база инициализировалась (в логе должна быть строка вида `ready for connections`):
+
 ```bash
-docker compose logs redis
+docker compose logs mysql | tail -20
 ```
 
-Перезапустить определенный контейнер:
+Проверяем, что тома созданы:
+
 ```bash
-docker compose restart nginx
+docker volume ls
 ```
 
-Перезапустить все контейнеры:
+Проверяем, что nginx отвечает (в ответ на пустой корень ожидаемы 403/404 - сайта еще нет):
+
 ```bash
-docker compose restart
+docker compose exec nginx sh -c "wget -S -O /dev/null http://127.0.0.1/ 2>&1 | head -5"
 ```
 
-Остановить все контейнеры:
+Проверяем, что контейнер `nginx` подключен к сети Traefik и Traefik его увидел:
+
 ```bash
-docker compose stop
+docker inspect dev_nginx --format "{{json .NetworkSettings.Networks}}"
+docker compose logs --tail=20 nginx
 ```
 
-Остановить все контейнеры, удалить их:
+В списке сетей должны быть обе: `dev_dev` и `proxy`. Если Traefik запущен с дашбордом, роутер сайта появится в разделе `HTTP Routers` с именем `dev@docker`.
+
+<a id="step7"></a>
+## Шаг 7. Распаковка файлов сайта в папку
+
+Корень сайта - каталог `www/` репозитория, подключенный в контейнеры `php`, `cron` и `nginx` как `/opt/www`. Архив распаковывается прямо на хосте, копировать что-либо внутрь контейнера не нужно.
+
+**7.1. Распаковываем архив в каталог `www/`:**
+
+- Linux/macOS:
 ```bash
-docker compose down
+tar -xzf ./www_YYYYMMDD.tar.gz -C ./www/
 ```
 
-Остановить все контейнеры, удалить их и удалить все тома этих контейнеров:
-```bash
-docker compose down -v
+- Windows PowerShell (`tar` входит в состав Windows 10/11):
+```powershell
+tar -xzf .\www_YYYYMMDD.tar.gz -C .\www\
 ```
 
-Зайти в sh-консоль определенного контейнера, например nginx:
+**7.2. Выставляем владельца.** Внутри контейнеров код сайта работает от пользователя `bitrix` с `uid:gid = 979:979`. На Linux-хосте выставляем владельца на хосте:
+
 ```bash
-docker compose exec nginx sh
+sudo chown -R 979:979 ./www
 ```
 
-Подробней можно прочитать в документации docker compose: https://docs.docker.com/reference/cli/docker/compose/
+На Windows с Docker Desktop (файлы лежат на диске Windows) владелец не имеет значения - права проксируются, шаг можно пропустить.
 
-> [!CAUTION]
-> Внимание! При использовании операционных систем ALT 10.x или ALT 11.x для команд `Docker Compose` нужно использовать тире, пример `docker-compose ...`. Так как compose поставляется отдельным исполняемым файлом `/usr/local/bin/docker-compose`.
+Каталог временных файлов остается томом, его владельца выставляем из контейнера:
 
-<a id="iporurls"></a>
-# Адресация
-
-Обращение к запущенному сайту может быть:
-1) через `localhost` или `127.0.0.1`
-2) по IP вашей локальной сети вида `10.X.X.X`, `192.X.X.X`, `172.X.X.X` и т.д.
-3) по имени локального домена в вашей локальной сети вида `dev.bx`
-4) по IP глобальной сети интернет вида `85.86.87.88`
-5) по имени настоящего домена вида `devexample.com`
-
-Выбор зависит от вашей конфигурации.
-
-Учтите, что при использовании `https` нужен SSL-сертификат, который можно сгенерировать или получить на доменное имя, но не на IP адрес.
-
-<a id="ports"></a>
-# Порты
-
-Запущенный сайт для своей работы по умолчанию использует порты:
-- `8588` для http
-- `8589` для https
-
-В случае, если вы используете фаервол, необходимо открыть порты. Пример команд для разных ОС:
-
-- Debian/Ubuntu и т.д.:
 ```bash
-ufw allow 8588 && ufw allow 8589
+docker compose exec --user=root php sh -c "chown -R bitrix:bitrix /opt/.bx_temp"
 ```
 
-- RHEL/CentOS/AlmaLinux/RockyLinux/OracleLinux/ArchLinux и т.д.:
+**7.3. Приводим права к обычным**, если на исходном сервере они были нестандартными (на больших сайтах команда выполняется несколько минут):
+
 ```bash
-firewall-cmd --add-port=8588/tcp --permanent && firewall-cmd --add-port=8589/tcp --permanent && firewall-cmd --reload
+docker compose exec --user=root php sh -c "find /opt/www -type d -exec chmod 755 {} \; ; find /opt/www -type f -exec chmod 644 {} \;"
 ```
 
-Для других ОС смотрите документацию по работе с фаерволом.
+**7.4. Проверяем результат** - список файлов должен совпадать при взгляде с хоста и из контейнера:
 
-<a id="siteaccess"></a>
-# Доступ к сайту
+```bash
+ls -la ./www | head -20
+docker compose exec --user=bitrix php sh -c "ls -la /opt/www | head -20; du -sh /opt/www"
+```
 
-Итак, согласно разделам [Адресация](#iporurls) и [Порты](#ports) выше, к сайту можно обратиться по `http` или `https` следующим образом:
-
-- через localhost:
-  - http://127.0.0.1:8588/
-  - https://127.0.0.1:8589/
-
-- по локальному IP адресу:
-  - http://10.0.1.119:8588/
-  - https://10.0.1.119:8589/
-
-- используя домен:
-  - http://dev.bx:8588/
-  - https://dev.bx:8589/
+В корне должны быть каталоги `bitrix`, `upload`, файл `index.php` и т.д.
 
 > [!IMPORTANT]
-> <b>НЕ</b> используйте `127.0.0.1` или `localhost` при работе с сайтом на локальной машине. Используйте IP адрес или домен, пример: `10.0.1.119` или `dev.bx`.
+> Каталог `www/` исключен из git через `.gitignore` - файлы сайта в репозиторий сборки не попадают. Если сайт ведется в отдельном git-репозитории, инициализируйте его прямо внутри `www/`.
 
-В примерах ниже будет использоваться локальный IP адрес `10.0.1.119` или локальный домен `dev.bx`.
+Особенности работы с папкой (производительность на Windows, права, IDE) - в разделе [Работа с файлами сайта из папки](#worksitefolder).
 
-<a id="bitrixservertestphp"></a>
-# Базовая проверка конфигурации окружения
+<a id="step8"></a>
+## Шаг 8. Создание базы данных и импорт дампа
 
-После запуска сайта необходимо провести базовую проверку конфигурации веб-сервера. Она выполняется с помощью скрипта `bitrix_server_test.php`.
+**8.1. Создаем базу и пользователя.** Кодировку и сравнение берем из пункта 2.2 (в примере - типовые для Битрикс `utf8mb4` / `utf8mb4_unicode_ci`):
 
-Используем способ, который работает одинаково на всех ОС.
-
-Заходим в sh-консоль контейнера `php` из-под пользователя `bitrix`:
 ```bash
-docker compose exec --user=bitrix php sh
+docker compose exec mysql mysql -u root -p -e "CREATE DATABASE sitemanager CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 ```
 
-Переходим в корневой каталог сайта и скачиваем скрипт `bitrix_server_test.php`:
 ```bash
-cd /opt/www/
-wget https://dev.1c-bitrix.ru/download/scripts/bitrix_server_test.php
+docker compose exec mysql mysql -u root -p -e "CREATE USER 'bitrix'@'%' IDENTIFIED BY 'ПАРОЛЬ_ПОЛЬЗОВАТЕЛЯ_БД'; GRANT ALL PRIVILEGES ON sitemanager.* TO 'bitrix'@'%'; FLUSH PRIVILEGES;"
 ```
 
-В браузере переходим по ссылке вида:
+Пароль вводится по запросу - это пароль `root`, заданный на шаге 5.2.
+
+> [!IMPORTANT]
+> Кодировка и сравнение новой базы должны совпадать с исходными. Расхождение приводит к "битым" русским буквам и к ошибкам сравнения строк уже после переезда.
+
+**8.2. Копируем дамп внутрь контейнера базы:**
+
+- Windows PowerShell:
+```powershell
+docker compose cp .\db_YYYYMMDD.sql.gz mysql:/tmp/db.sql.gz
+```
+
+- Linux/macOS:
 ```bash
-http://10.0.1.119:8588/bitrix_server_test.php
+docker compose cp ./db_YYYYMMDD.sql.gz mysql:/tmp/db.sql.gz
+```
+
+**8.3. Импортируем дамп.** Команда выполняется внутри контейнера, поэтому работает одинаково на всех ОС:
+
+```bash
+docker compose exec mysql bash -c "gunzip -c /tmp/db.sql.gz | mysql -u root -p --default-character-set=utf8mb4 sitemanager"
+```
+
+Импорт крупной базы занимает от нескольких минут до нескольких часов. Прервать процесс на середине нельзя - при обрыве базу нужно удалить (`DROP DATABASE`), создать заново и повторить импорт.
+
+Если импорт завершается ошибкой `MySQL server has gone away` или `Packet too large` - увеличиваем `max_allowed_packet` в `confs/mysql/etc/my.cnf.d/my.cnf` (см. пункт 5.6), перезапускаем базу и импортируем заново:
+
+```bash
+docker compose restart mysql
+```
+
+**8.4. Проверяем импорт.** Количество таблиц должно совпасть с исходным (пункт 2.2):
+
+```bash
+docker compose exec mysql mysql -u root -p -e "SELECT COUNT(*) AS tables FROM information_schema.tables WHERE table_schema='sitemanager'; SELECT COUNT(*) AS users FROM sitemanager.b_user;"
+```
+
+**8.5. Удаляем дамп из контейнера** - он больше не нужен и занимает место:
+
+```bash
+docker compose exec mysql bash -c "rm -f /tmp/db.sql.gz"
+```
+
+<a id="step9"></a>
+## Шаг 9. Подключение сайта к базе данных
+
+Файлы сайта перенесены, база импортирована - осталось связать их. Внутри сети сборки база доступна по имени сервиса `mysql`, порт `3306`.
+
+Для правки файлов ставим редактор в контейнере `php` (один раз):
+
+```bash
+docker compose exec --user=root php sh -c "apk add mc"
+```
+
+**9.1. Файл `/opt/www/bitrix/php_interface/dbconn.php`** (используется классическим ядром):
+
+```bash
+docker compose exec --user=bitrix php sh -c "mcedit /opt/www/bitrix/php_interface/dbconn.php"
+```
+
+Приводим параметры подключения к виду:
+
+```php
+$DBHost = "mysql";
+$DBName = "sitemanager";
+$DBLogin = "bitrix";
+$DBPassword = "ПАРОЛЬ_ПОЛЬЗОВАТЕЛЯ_БД";
+```
+
+**9.2. Файл `/opt/www/bitrix/.settings.php`** (используется ядром D7):
+
+```bash
+docker compose exec --user=bitrix php sh -c "mcedit /opt/www/bitrix/.settings.php"
+```
+
+Приводим блок `connections` к виду:
+
+```php
+  'connections' => array(
+    'value' => array(
+      'default' => array(
+        'className' => '\\Bitrix\\Main\\DB\\MysqliConnection',
+        'host' => 'mysql',
+        'database' => 'sitemanager',
+        'login' => 'bitrix',
+        'password' => 'ПАРОЛЬ_ПОЛЬЗОВАТЕЛЯ_БД',
+        'options' => 2,
+      ),
+    ),
+    'readonly' => true,
+  ),
+```
+
+**9.3. Проверяем подключение к базе из PHP:**
+
+```bash
+docker compose exec --user=bitrix php sh -c "php -r '\$c = new mysqli(\"mysql\", \"bitrix\", \"ПАРОЛЬ_ПОЛЬЗОВАТЕЛЯ_БД\", \"sitemanager\"); echo \$c->connect_error ?: \"connect OK\"; echo PHP_EOL;'"
+```
+
+> [!NOTE]
+> Если появляется ошибка аутентификации, а сайт работает на старой версии ядра, создайте пользователя базы с устаревшим плагином:
+> `CREATE USER 'bitrix'@'%' IDENTIFIED WITH mysql_native_password BY 'ПАРОЛЬ';`
+> Учтите: этот плагин объявлен устаревшим в MySQL 8.0.34 и удален в 8.4, поэтому для Percona Server `8.4.x` он недоступен.
+
+<a id="step10"></a>
+## Шаг 10. Очистка кеша и настроек старого окружения
+
+Сайт переехал вместе с настройками старого сервера. Их нужно вычистить, иначе сайт будет обращаться к недоступным хостам и путям.
+
+**10.1. Ищем пути старого сервера в конфигурации:**
+
+```bash
+docker compose exec --user=bitrix php sh -c "grep -rn '/home/bitrix' /opt/www/bitrix/.settings.php /opt/www/bitrix/.settings_extra.php /opt/www/bitrix/php_interface/ 2>/dev/null"
+```
+
+Все найденные пути заменяем на пути сборки: корень сайта - `/opt/www`, каталог временных файлов - `/opt/.bx_temp`.
+
+**10.2. Правим `/opt/www/bitrix/.settings.php`:**
+
+- блоки `cache` и `session`: на время переезда переводим на файлы - удаляем блоки целиком (кеш по умолчанию файловый) либо указываем новые хосты `memcached`/`redis` (см. [Шаг 16](#step16)). Старые адреса вида `127.0.0.1` или IP прежнего сервера оставлять нельзя;
+- блок `pull` (push-сервер): в этой сборке push-сервера нет, блок удаляем или выставляем `'nginx' => 'N'`, `'push' => 'N'`, `'websocket' => 'N'`;
+- блок `smtp`, пути к лог-файлам, `composer.config_path` - проверяем, что указанные пути существуют в новом окружении.
+
+Файл `/opt/www/bitrix/.settings_extra.php` (если есть) проверяем по тем же правилам - настройки из него перекрывают `.settings.php`.
+
+**10.3. Чистим кеш и сгенерированные файлы:**
+
+```bash
+docker compose exec --user=bitrix php sh -c "rm -rf /opt/www/bitrix/cache/* /opt/www/bitrix/managed_cache/* /opt/www/bitrix/stack_cache/* /opt/www/bitrix/html_pages/* /opt/www/upload/resize_cache/*"
+```
+
+**10.4. Перезапускаем PHP и cron, чтобы сбросить кеш опкода:**
+
+```bash
+docker compose restart php cron
+```
+
+<a id="step11"></a>
+## Шаг 11. Первое открытие сайта и проверка
+
+**11.1. Определяем адрес.** Сайт открывается по домену из `SITE_DOMAIN`, TLS выдает Traefik:
+
+```bash
+https://site.example.com/
+```
+
+Обращение по `http://` должно автоматически перенаправляться на `https://` - за это отвечает middleware редиректа в labels сервиса `nginx`.
+
+> [!IMPORTANT]
+> <b>НЕ</b> используйте `127.0.0.1` или `localhost` при работе с сайтом - часть функционала Битрикс (проверка домена, ссылки в письмах, авторизация) работает некорректно. Работайте по домену, который указан в `SITE_DOMAIN`.
+>
+> В примерах ниже используется адрес `https://site.example.com`.
+
+Открываем сайт в браузере. Ожидаемый результат - публичная часть сайта или страница авторизации `/bitrix/admin/`.
+
+**11.2. Если что-то не открылось**, смотрим логи снизу вверх - сначала сам сайт, потом прокси:
+
+```bash
+docker compose logs --tail=100 nginx
+docker compose logs --tail=100 php
+docker logs --tail=100 traefik
+```
+
+Полезная проверка: сайт можно запросить напрямую, минуя Traefik, изнутри контейнера. Если так страница отдается, а через домен нет - проблема в Traefik или DNS, а не в сборке:
+
+```bash
+docker compose exec nginx sh -c "wget -S -O /dev/null -H 'X-Forwarded-Proto: https' http://127.0.0.1/ 2>&1 | head -10"
+```
+
+Типовые ситуации разобраны в разделе [Диагностика типовых проблем](#part6).
+
+**11.3. Базовая проверка конфигурации окружения** скриптом `bitrix_server_test.php`:
+
+```bash
+docker compose exec --user=bitrix php sh -c "cd /opt/www && wget https://dev.1c-bitrix.ru/download/scripts/bitrix_server_test.php"
+```
+
+Открываем в браузере:
+
+```bash
+https://site.example.com/bitrix_server_test.php
 ```
 
 > [!CAUTION]
-> Внимание! После проверки конфигурации окружения скрипт `bitrix_server_test.php` нужно удалить.
+> Внимание! После проверки скрипт `bitrix_server_test.php` обязательно удаляем:
+> ```bash
+> docker compose exec --user=bitrix php sh -c "rm -f /opt/www/bitrix_server_test.php"
+> ```
 
-Для Docker Engine на Linux расположение каталога сайта на хосте зависит от режима работы docker-а:
-- rootfull:
-```bash
-/var/lib/docker/volumes/dev_www_data/_data/
-```
+**11.4. Проверка системы** средствами продукта - страница `Проверка системы` (`/bitrix/admin/site_checker.php?lang=ru`), запускаем `Тестирование конфигурации`. На этом этапе допустимы замечания по почте, cron и поиску - их настраиваем на шагах 13, 15 и 17.
 
-- rootless:
-```bash
-/home/[USERNAME]/.local/share/docker/volumes/dev_www_data/_data
-```
+<a id="step12"></a>
+## Шаг 12. Настройки модулей, лицензия и обновления
 
-<a id="bitrixsetupphprestorephp"></a>
-# BitrixSetup / Restore
+**12.1. Главный модуль (main)** - страница `/bitrix/admin/settings.php?lang=ru&mid=main`:
 
-Для установки продуктов компании 1С-Битрикс можно использовать скрипт `bitrixsetup.php`: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=135&LESSON_ID=4523&LESSON_PATH=10495.4495.4523
-
-Для восстановления из резервной копии скрипт `restore.php`: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=135&CHAPTER_ID=02014&LESSON_PATH=10495.4496.2014
-
-Заходим в sh-консоль контейнера `php` из-под пользователя `bitrix`:
-```bash
-docker compose exec --user=bitrix php sh
-```
-
-Переходим в корневой каталог сайта и скачиваем скрипт(ы):
-```bash
-cd /opt/www/
-wget https://www.1c-bitrix.ru/download/scripts/bitrixsetup.php
-wget https://www.1c-bitrix.ru/download/scripts/restore.php
-```
-
-В браузере переходим по ссылке вида:
-- для установки:
-```bash
-http://10.0.1.119:8588/bitrixsetup.php
-```
-
-- для восстановления:
-```bash
-http://10.0.1.119:8588/restore.php
-```
-
-Устанавливаем продукт или восстанавливаем сайт, зависит от вашего выбора.
-
-<a id="installdistro"></a>
-## Установка дистрибутивов
-
-Используем скрипт `bitrixsetup.php`, скачиваем дистрибутив продукта компании 1С-Битрикс, демо или лицензионную версию.
-
-Редакция и тип базы зависит от вашего выбора.
-
-После переходим на сайт, используя URL:
-```bash
-http://10.0.1.119:8588/
-```
-
-Проходим мастер установки дистрибутива:
-- `1С-Битрикс: Управление сайтом` - https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=135&CHAPTER_ID=04522&LESSON_PATH=10495.4495.4522
-- `1С-Битрикс24` - https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=135&CHAPTER_ID=04522&LESSON_PATH=10495.4495.4522
-
-На шаге создания базы вводим параметры подключения к ней:
-
-- для `MySQL` версии:
-  - Имя хоста (алиас) - `mysql`
-  - Имя суперпользователя - `root`
-  - Пароль суперпользователя - был создан вами в главе [Пароли к базам данных MySQL и PostgreSQL](#databasespasswords), хранится в файле `.env_sql`
-
-- для `PostgreSQL` версии:
-  - Имя хоста (алиас) - `postgres`
-  - Имя суперпользователя - `postgres`
-  - Пароль суперпользователя - был создан вами в главе [Пароли к базам данных MySQL и PostgreSQL](#databasespasswords), хранится в файле `.env_sql`
-
-<a id="restorebackup"></a>
-## Восстановление из резервной копии
-
-Используем скрипт `restore.php`, восстанавливаем сайт из резервной копии.
-
-Если архив сайта был размещен на сайте (в облаке) клиента, то необходимо выбрать вариант `Скачать резервную копию с другого сайта` и указать путь к архиву.
-
-Если архив сайта был размещен в облаке 1С-Битрикс, то необходимо выбрать вариант `Развернуть резервную копию из облака "1С-Битрикс"` и указать активный лицензионный ключ.
-
-Также архив сайта можно `Загрузить с локального диска`, выбрав нужные файлы.
-
-Если `Архив загружен в корневую папку сервера`, то появится пункт, который позволит распаковать файлы в корень сайта соответственно.
-
-После скачивания архива и завершения распаковки файлов необходимо будет указать настройки соединения с базой данных, если при создании резервной копии был создан дамп базы данных.
-
-Нажимаем кнопку `Восстановить` и ждем завершения работы сценария.
-
-После успешного восстановления нажимаем кнопку `Удалить локальную копию и служебные скрипты`.
-
-<a id="licenceandupdates"></a>
-# Лицензия, обновления платформы и решений
-
-Перед дальнейшим использованием продуктов 1С-Битрикс рекомендуется обновить их до последних версий.
-
-Для этого вам понадобится лицензионный ключ для продукта выбранной редакции.
-
-Дальше нужно зайти в настройки `Главный модуль (main)` (`/bitrix/admin/settings.php?lang=ru&mid=main`), на вкладке `Система обновлений` заполнить поле `Лицензионный ключ`.
-
-Перейти на страницу `Обновление платформы` (`/bitrix/admin/update_system.php?lang=ru`), обновить систему обновлений, принять новые лицензионные соглашения (если это потребуется) и установить все доступные обновления.
-
-Рекомендуется перейти на страницу `Обновление решений` (`/bitrix/admin/update_system_partner.php?lang=ru`) и установить обновления сторонних решений.
-
-<a id="modulessettings"></a>
-# Настройки модулей
-
-После установки дистрибутива или восстановления сайта из бекапа необходимо настроить модули этого сайта.
-
-Настроим `Главный модуль (main)` (`/bitrix/admin/settings.php?lang=ru&mid=main`):
-
-- на вкладке `Настройки`:
-  - указываем `Название сайта`
-  - задаем `URL сайта (без http://, например www.mysite.com)` -  10.0.1.119:8588 или 10.0.1.119:8589, dev.bx:8588 или dev.bx:8589 и т.д.
-  - отмечаем опцию `Быстрая отдача файлов через Nginx` - она сконфигурирована
-
-- на вкладке `Авторизация`:
-  - снимаем отметку у опции `Продлевать сессию при активности посетителя в окне браузера`
-
-- на вкладке `Журнал событий`:
-  - отмечаем опции записи событий в журнал событий (на выбор из множества опций)
-
-- на вкладке `Система обновлений`:
-  - заполняем поле `Лицензионный ключ`
-  - заполняем поле `Имя сервера, содержащего обновления`
+- вкладка `Настройки`:
+  - `Название сайта`;
+  - `URL сайта (без http://)` - домен из `SITE_DOMAIN`, например `site.example.com` (без порта, сайт работает на стандартном 443);
+  - включаем `Быстрая отдача файлов через Nginx` - в сборке она сконфигурирована;
+- вкладка `Авторизация`: снимаем `Продлевать сессию при активности посетителя в окне браузера`;
+- вкладка `Журнал событий`: отмечаем нужные события;
+- вкладка `Система обновлений`: заполняем `Лицензионный ключ` и `Имя сервера, содержащего обновления`.
 
 Сохраняем настройки.
 
-Для остальных модулей производим настройки, если они нужны.
+**12.2. Настройки сайта** - страница `Список сайтов` (`/bitrix/admin/site_admin.php?lang=ru`). Проверяем у каждого сайта поля `URL сервера` и `Путь к корневой папке веб-сервера` (должно быть пусто либо `/opt/www`).
 
-Описание значений полей смотрите документации модуля.
+**12.3. Обновления.** Переходим на страницу `Обновление платформы` (`/bitrix/admin/update_system.php?lang=ru`), обновляем систему обновлений, принимаем лицензионные соглашения и ставим доступные обновления. Затем - `Обновление решений` (`/bitrix/admin/update_system_partner.php?lang=ru`).
 
-<a id="sitechecker"></a>
-# Проверка системы
+> [!NOTE]
+> Обновляйте платформу только после того, как перенесенный сайт открылся и работает. Совмещать переезд и обновление в одном шаге - плохая идея: непонятно, что именно сломалось.
 
-Для всесторонней проверки соответствия параметров системы, на которой осуществляется функционирование сайта, минимальным и рекомендуемым техническим требованиям продукта используйте страницу `Проверка системы` (`/bitrix/admin/site_checker.php?lang=ru`).
+<a id="step13"></a>
+## Шаг 13. Cron и агенты
 
-Документация:
-- https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=35&LESSON_ID=14020&LESSON_PATH=3906.4493.4506.2024.14020
-- https://dev.1c-bitrix.ru/user_help/settings/utilities/site_checker.php
+За периодические задания отвечает отдельный контейнер `cron` на образе `bitrix24/php`. По умолчанию он раз в минуту от пользователя `bitrix` выполняет:
 
-<a id="perfmonpanel"></a>
-# Тест производительности
-
-Для оценки производительности перейдите на страницу `Панель производительности` (`/bitrix/admin/perfmon_panel.php?lang=ru`).
-
-Выполните тест конфигурации. Результаты подскажут "узкие" места системы или ее конфигурации.
-
-Документация: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=35&CHAPTER_ID=03376&LESSON_PATH=3906.6663.4904.3376
-
-<a id="cron"></a>
-# Cron
-
-<a id="agentsoncron"></a>
-## Выполнение агентов на cron
-
-Для работы cron заданий используется отдельный контейнер `cron` на базе образа `bitrix24/php`.
-
-По умолчанию контейнер сконфигурирован на выполнение заданий модуля `Главный модуль (main)` раз в минуту, запуская это исполнение от пользователя `bitrix`:
 ```bash
 php -f /opt/www/bitrix/modules/main/tools/cron_events.php
 ```
 
-Это задание будет выполнятся только в том случае, если дистрибутив установлен.
+Чтобы агенты и рассылка почты выполнялись из-под cron, а не по хитам посетителей, добавляем в файл `/opt/www/bitrix/php_interface/dbconn.php` строку:
 
-Для завершения настройки необходимо в административной части продукта на странице `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`) отредактировать файл `/bitrix/php_interface/dbconn.php`, добавить строку:
 ```php
 define("BX_CRONTAB_SUPPORT", true);
 ```
 
-Cохранить изменения в файле.
+Редактировать можно из административной части на странице `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`) или из консоли:
 
-После этого все агенты и отправка системных событий будут обрабатываться из-под cron, раз в 1 минуту. Настройка завершена.
-
-Проверить настройку можно на странице `Проверка системы` (`/bitrix/admin/site_checker.php?lang=ru`) и на странице `Список агентов` (`/bitrix/admin/agent_list.php?lang=ru`).
-
-<a id="owncrontasks"></a>
-## Кастомные cron задания
-
-Cron задания хранятся в папке `/etc/periodic/` контейнера `cron`.
-
-Внутри каталога размещены подкаталоги, указывающие на периодичность запуска заданий:
 ```bash
-1min
-15min
-hourly
-daily
-weekly
-monthly
+docker compose exec --user=bitrix php sh -c "mcedit /opt/www/bitrix/php_interface/dbconn.php"
 ```
 
-Для примера создадим задание, которое выполняется раз в сутки - создание резервной копии сайта с базой MySQL - бекап.
+Проверяем работу:
 
-Заходим в sh-консоль контейнера `cron` из-под пользователя `root`:
 ```bash
-docker compose exec --user=root cron sh
+docker compose logs --tail=50 cron
 ```
 
-В каталоге `/etc/periodic/daily/` создадим файл `backup` без указания расширения файла.
-```bash
-apk add mc
-mcedit /etc/periodic/daily/backup
-```
+и на страницах `Проверка системы` (`/bitrix/admin/site_checker.php?lang=ru`) и `Список агентов` (`/bitrix/admin/agent_list.php?lang=ru`).
 
-Заполним содержимое файла:
-```bash
-#!/bin/sh
-#
-su - bitrix -c 'php -f /opt/www/bitrix/modules/main/tools/backup.php; > /dev/null 2>&1'
-#
-```
+Свои задания добавляются в каталоги `/etc/periodic/{1min,15min,hourly,daily,weekly,monthly}` контейнера `cron` - пример есть в разделе [Бекап средствами Битрикс по cron](#backupbybitrix).
 
-Сохраняем файл.
-Делаем его исполняемым:
-```bash
-chmod -R a+x /etc/periodic/daily
-```
+<a id="step14"></a>
+## Шаг 14. Временные файлы вне корня сайта
 
-Создаем файл `/etc/crontabs/cron.update`, чтобы `crond` демон перезапустил задания крона:
-```bash
-touch /etc/crontabs/cron.update
-```
+Конфигурация `nginx` в сборке уже подготовлена так, чтобы временные файлы хранились вне корня сайта (том `dev_bxtemp_data`, каталог `/opt/.bx_temp`) - это существенно повышает защищенность от известных атак.
 
-Итог: раз в день (в 2ч ночи) контейнер запустит `backup` задание и выполнит резервное копирование.
+Для завершения настройки добавляем в файл `/opt/www/bitrix/php_interface/dbconn.php` строку:
 
-Детали создания резервной копии будут доступны в логе контейнера `cron`. Пример:
-```
-crond: USER root pid 122 cmd run-parts /etc/periodic/15min
-0.19 sec	Backup started to file: /opt/www/bitrix/backup/20250423_113000_full_vnw0wuf76rq6e5je.tar
-0.19 sec	Dumping database
-14.18 sec	Archiving database dump
-14.2 sec	Archiving files
-167.01 sec	Finished.
-Data size: 2569.42 M
-Archive size: 2569.42 M
-Time: 166.76 sec
-```
-
-Документация: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=35&LESSON_ID=4464&LESSON_PATH=3906.4833.4464
-
-<a id="bxtemporaryfilesdirectory"></a>
-# Хранение временных файлов вне корневой директории сайта
-
-По умолчанию конфигурация `nginx` предварительно подготовлена таким образом, чтобы временные файлы хранились вне пределов корневой директории сайта, так как это существенно повышает защищенность от известных атак.
-
-Для завершения настройки и усиления безопасности, необходимо в административной части продукта на странице `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`) отредактировать файл `/bitrix/php_interface/dbconn.php`, добавить строку:
 ```php
 define("BX_TEMPORARY_FILES_DIRECTORY", "/opt/.bx_temp");
 ```
 
-Cохранить.
+Проверить настройку можно на странице `Сканер безопасности` (`/bitrix/admin/security_scanner.php?lang=ru`) модуля `Проактивная защита (security)`.
 
-Проверить настройку можно на странице `Сканер безопасности` (`/bitrix/admin/security_scanner.php?lang=ru`) модуля `Проактивной защиты (security)`.
+<a id="step15"></a>
+## Шаг 15. Почта
 
-<a id="pushpull"></a>
-# Push & pull
+Образ `bitrix24/php` содержит mta `msmtp`. Его настройки для аккаунта `default` хранятся в файле `/opt/msmtp/.msmtprc` (том `dev_msmtp_data`).
 
-<a id="pushserver"></a>
-## Push-сервер
+Пример настроек для локального почтового сервера без TLS:
 
-Для работы Push-сервера будет запущено два контейнера: один для режима `pub`, второй для режима `sub`. Оба используют один образ `bitrix24/push`.
-
-Параметры переменных сред контейнеров хранятся в файлах `.env_push_pub` и `.env_push_sub`.
-
-Cекретный ключ для подписи соединения между клиентом и push-сервером хранится в файле `.env_push` и был создан вами в главе [Секретный ключ для Push-сервера](#pushserversecretkey).
-
-Push-сервер используется в связке с контейнером `redis`. По умолчанию сервис `redis` работает в режиме "без пароля". Возможно и обратное, когда сервис `redis` работает в режиме "обязательно с паролем". Настройка пароля для `Redis` описана выше в главе [Пароль для Redis](#redispassword).
-
-> [!CAUTION]
-> Внимание! Поддержка работы сервиса `push` в связке с сервисом `redis`, использующим пароль, доступна с версии `3.3` и выше (образ `bitrix24/push:3.3-v1-alpine`).
-
-Возвращаемся к главам [Адресация](#iporurls) и [Порты](#ports) этого документа. Определяемся по какой схеме работает сайт. Например:
-- используется локальный IP вида `10.0.1.119`
-- порт для http `8588`
-- порт для https `8589`
-
-Итого получается:
-- для http: `10.0.1.119:8588`
-- для https: `10.0.1.119:8589`
-
-Запоминаем эти значения.
-
-В административной части продукта на странице `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`) редактируем файл `/bitrix/.settings.php`:
-- добавляем блок настроек Push-сервера
-- меняем значения опции `signature_key`, указываем ваш сгенерированный уникальный секретный ключ вместо шаблона `CHANGE_SECURITY_KEY_HERE`
-- меняем значения для `http` и `https` на ваши
-- пример:
-```php
-  'pull' => array(
-    'value' => array(
-      'path_to_listener' => 'http://10.0.1.119:8588/bitrix/sub/',
-      'path_to_listener_secure' => 'https://10.0.1.119:8589/bitrix/sub/',
-      'path_to_modern_listener' => 'http://10.0.1.119:8588/bitrix/sub/',
-      'path_to_modern_listener_secure' => 'https://10.0.1.119:8589/bitrix/sub/',
-      'path_to_mobile_listener' => 'http://10.0.1.119:8893/bitrix/sub/',
-      'path_to_mobile_listener_secure' => 'https://10.0.1.119:8894/bitrix/sub/',
-      'path_to_websocket' => 'ws://10.0.1.119:8588/bitrix/subws/',
-      'path_to_websocket_secure' => 'wss://10.0.1.119:8589/bitrix/subws/',
-      'path_to_publish' => 'http://10.0.1.119:8588/bitrix/pub/',
-      'path_to_publish_web' => 'http://10.0.1.119:8588/bitrix/rest/',
-      'path_to_publish_web_secure' => 'https://10.0.1.119:8589/bitrix/rest/',
-      'path_to_json_rpc' => 'http://10.0.1.119:8588/bitrix/api/',
-      'nginx_version' => '4',
-      'nginx_command_per_hit' => '100',
-      'nginx' => 'Y',
-      'nginx_headers' => 'N',
-      'push' => 'Y',
-      'websocket' => 'Y',
-      'signature_key' => 'CHANGE_SECURITY_KEY_HERE',
-      'signature_algo' => 'sha1',
-      'guest' => 'N',
-    ),
-  ),
-```
-
-Сохраняем файл.
-
-Для продукта Битрикс24 проверить настройку Push-сервера можно на странице `Проверка системы` (`/bitrix/admin/site_checker.php?lang=ru`), используя вкладку `Работа портала`.
-
-<a id="sphinx"></a>
-# Sphinx
-
-<a id="sphinxsearch"></a>
-## Поиск с помощью Sphinx
-
-Для работы полнотекстового поиска, используя `Sphinx`, будет запущен один контейнер на базе образа `bitrix24/sphinx`.
-
-Для запуска и настройки:
-- переходим в настройки модуля `Поиск` (`/bitrix/admin/settings.php?lang=ru&mid=search`)
-- на вкладке `Морфология`:
-  - выбираем `Полнотекстовый поиск с помощью` - `Sphinx`
-  - заполняем строку `Строка подключения для управления индексом (протокол MySql)` - `sphinx:9306`
-  - поле `Идентификатор индекса` не меняем - `bitrix`
-
-Сохраняем настройки модуля.
-
-На странице `Переиндексация сайта` (`/bitrix/admin/search_reindex.php?lang=ru`) снимаем галку `Переиндексировать только измененные` и выполняем полную переиндексацию сайта.
-
-Настройка завершена.
-
-Для продукта Битрикс24 проверить работу можно в разделе `/search/` сайта.
-
-Документация: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=35&CHAPTER_ID=04507&LESSON_PATH=3906.4507
-
-> [!IMPORTANT]
-> Для продуктов, использующих базу данных PostgreSQL, нужно обновление модуля `search` версии `25.0.0` и выше.
-
-<a id="email"></a>
-# Почта
-
-<a id="msmtpmta"></a>
-## Отправка почты с помощью msmtp
-
-Образ `bitrix24/php` в своем составе содержит mta `msmtp`, предназначенный для отправки писем.
-
-Настройки msmtp для аккаунта `default` хранятся в файле `/opt/msmtp/.msmtprc`.
-
-Значения настроек msmtp зависят от smtp-сервера, с которым он будет взаимодействовать при работе.
-
-Например, локальный почтовый сервер, отвечает на порту `25`, расположен на хосте `mail.server.local`, не использует в своей работе `tls`. В файле `/opt/msmtp/.msmtprc` настройки будут выглядеть:
 ```bash
-...
 host mail.server.local
 port 25
 from info@mail.server.local
 user info@mail.server.local
 password password_example
-...
 tls off
 tls_starttls off
 tls_certcheck off
-...
 ```
 
-Другой пример: почтовые сервисы вида `Gmail`, `Yahoo`, `Yandex`, `Rambler` и т.д.
-
-Настройки почтовых сервисов приведены в курсе: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=37&LESSON_ID=12265
-
-Для `Gmail`, который отвечает на порту `587`, расположен на хосте `smtp.gmail.com`, использует в своей работе `tls`. В файле `/opt/msmtp/.msmtprc` полный список настроек выглядит так:
+Пример полного набора настроек для `Gmail`:
 
 ```bash
 # smtp account configuration for default
@@ -819,62 +871,36 @@ tls_trust_file /etc/ssl/certs/ca-certificates.crt
 protocol smtp
 ```
 
-Настроим отправку писем через `Gmail`.
+Настройки почтовых сервисов приведены в курсе: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=37&LESSON_ID=12265
 
-В блоке настроек выше меняем `APP_PASSWORD` на пароль приложения, `LOGIN` на ваш логин в почте Google.
+Редактируем файл:
 
-Заходим в sh-консоль контейнера `php` из-под пользователя `root`:
 ```bash
-docker compose exec --user=root php sh
+docker compose exec --user=bitrix php sh -c "mcedit /opt/msmtp/.msmtprc"
 ```
 
-Устанавливаем `mc` и выходим:
-```bash
-apk add mc
-exit
-```
-
-Заходим в sh-консоль контейнера `php` из-под пользователя `bitrix`:
-```bash
-docker compose exec --user=bitrix php sh
-```
-
-Редактируем файл `/opt/msmtp/.msmtprc`, указываем приготовленный блок настроек:
-```bash
-mcedit /opt/msmtp/.msmtprc
-```
-
-Сохраняем файл и выходим из контейнера `php`.
-
-После в административной части продукта необходимо настроить модули, указав email отправителя (или От кого):
-- `Главный модуль (main)` (`bitrix/admin/settings.php?lang=ru&mid=main`)
+После этого в административной части указываем e-mail отправителя в настройках модулей:
+- `Главный модуль (main)` (`/bitrix/admin/settings.php?lang=ru&mid=main`)
 - `Email-маркетинг (sender)` (`/bitrix/admin/settings.php?lang=ru&mid=sender`)
 - `Интернет-магазин (sale)` (`/bitrix/admin/settings.php?lang=ru&mid=sale`)
 - `Подписка, рассылки (subscribe)` (`/bitrix/admin/settings.php?lang=ru&mid=subscribe`)
 - `Форум (forum)` (`/bitrix/admin/settings.php?lang=ru&mid=forum`)
 
-Проверить отправку почты можно на странице `Проверка системы` (`/bitrix/admin/site_checker.php?lang=ru`), запустив `Тестирование конфигурации`.
+Проверяем отправку на странице `Проверка системы` (`/bitrix/admin/site_checker.php?lang=ru`), запустив `Тестирование конфигурации`. Результат отображается в блоке `Дополнительные функции`:
 
-Результаты будут отображены в блоке отчета `Дополнительные функции`:
 ```
 Отправка почты - Отправлено. Время отправки: 1.36 сек.
 Отправка почтового сообщения больше 64Кб - Отправлено. Время отправки: 1.55 сек.
 ```
 
-Детали отправки (или возникающие ошибки) будут доступны в логе контейнера `php`. Пример для двух писем из тестирования конфигурации:
+Детали отправки и ошибки видны в логе контейнера `php`:
+
+```bash
+docker compose logs --tail=50 php
 ```
-Apr 12 22:52:14 host=smtp.gmail.com tls=on auth=on user=***@gmail.com from=***@gmail.com recipients=hosting_test@bitrixsoft.com mailsize=211 smtpstatus=250 smtpmsg='250 2.0.0 OK  1744498333 2adb3069b0e04-54d3d502717sm712937e87.144 - gsmtp' exitcode=EX_OK
-Apr 12 22:52:15 host=smtp.gmail.com tls=on auth=on user=***@gmail.com from=***@gmail.com recipients=hosting_test@bitrixsoft.com,noreply@bitrixsoft.com mailsize=200205 smtpstatus=250 smtpmsg='250 2.0.0 OK  1744498335 2adb3069b0e04-54d3d502618sm743850e87.107 - gsmtp' exitcode=EX_OK
-```
 
-<a id="emailsmtpmailer"></a>
-## Отправка почты через SMTP-сервера отправителя
+**Альтернатива: SMTP-сервера отправителя** (без msmtp, средствами главного модуля). В файл `/opt/www/bitrix/.settings.php` добавляем блок:
 
-Для отправки почты используем возможности `Главного модуля (main)` без каких-либо дополнительных контейнеров и т.д.
-
-Активируем возможность использования SMTP-сервера отправителя: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&LESSON_ID=23612&LESSON_PATH=3913.3516.5062.2795.23612
-
-Для этого в административной части продукта на странице `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`) редактируем файл `/bitrix/.settings.php`, добавляем блок настроек:
 ```php
     'smtp' => [
         'value' => [
@@ -886,37 +912,21 @@ Apr 12 22:52:15 host=smtp.gmail.com tls=on auth=on user=***@gmail.com from=***@g
     ],
 ```
 
-После переходим на страницу `Добавление SMTP подключения` (`/bitrix/admin/smtp_edit.php?lang=ru`).
+Затем на странице `Добавление SMTP подключения` (`/bitrix/admin/smtp_edit.php?lang=ru`) заполняем параметры SMTP и сохраняем. Лог отправки - в файле `/bitrix/modules/smtp_mailer.log`.
 
-Заполняем поля на странице, указываем параметры smtp и сохраняем настройки.
-
-После необходимо настроить модули, указав email отправителя (или От кого):
-- `Главный модуль (main)` (`bitrix/admin/settings.php?lang=ru&mid=main`)
-- `Email-маркетинг (sender)` (`/bitrix/admin/settings.php?lang=ru&mid=sender`)
-- `Интернет-магазин (sale)` (`/bitrix/admin/settings.php?lang=ru&mid=sale`)
-- `Подписка, рассылки (subscribe)` (`/bitrix/admin/settings.php?lang=ru&mid=subscribe`)
-- `Форум (forum)` (`/bitrix/admin/settings.php?lang=ru&mid=forum`)
-
-Настройки почтовых сервисов: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=37&LESSON_ID=12265
-
-Проверить настройки можно отправив письмо самому себе. Для этого нужно отредактировать параметры пользователя, указав `E-Mail` и отметить опцию `Оповестить пользователя`.
-
-Лог отправки будет в файле `/bitrix/modules/smtp_mailer.log`.
+Документация: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&LESSON_ID=23612&LESSON_PATH=3913.3516.5062.2795.23612
 
 > [!NOTE]
-> Проверка системы при тестировании параметров не использует SMTP-сервера отправителя. Два теста почты будут красными. Можно это проигнорировать.
+> `Проверка системы` при тестировании не использует SMTP-сервера отправителя, два почтовых теста будут красными. Это можно проигнорировать.
 
-<a id="emaildebuglog"></a>
-## Логирование отправки почты в файл
+**Логирование отправки почты в файл** (для диагностики). В `/opt/www/bitrix/php_interface/dbconn.php` добавляем:
 
-Если отправка почты не работает, можно включить логирование процесса отправки в файл для диагностики проблемы.
-
-Для этого в административной части продукта на странице `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`) редактируем файл `/bitrix/php_interface/dbconn.php`, добавляем строку:
 ```php
 define("LOG_FILENAME", $_SERVER["DOCUMENT_ROOT"]."/bitrix/modules/mail_log.txt");
 ```
 
-Создаем файл `/bitrix/php_interface/init.php` если его нет, добавляем код функции `custom_mail`:
+В файл `/opt/www/bitrix/php_interface/init.php` (создаем, если его нет) добавляем функцию:
+
 ```php
 function custom_mail($to, $subject, $message, $additional_headers='', $additional_parameters='')
 {
@@ -938,19 +948,689 @@ function custom_mail($to, $subject, $message, $additional_headers='', $additiona
 }
 ```
 
-Лог отправки будет в файле `/bitrix/modules/mail_log.txt`.
-
 Документация: https://dev.1c-bitrix.ru/api_help/main/functions/other/bxmail.php
 
+<a id="step16"></a>
+## Шаг 16. Кеш и сессии в memcached или redis
+
+После успешного переезда переводим кеш и сессии с файлов на `memcached` или `redis` - оба контейнера уже запущены и доступны внутри сети по именам `memcached:11211` и `redis:6379`.
+
+Настройки задаются в файле `/opt/www/bitrix/.settings.php`, редактировать удобно через `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`).
+
+**Кеширование**, вариант `memcache`:
+
+```php
+        // cache on memcache
+        'cache' => [
+                'value' => [
+                        'type' => [
+                                'class_name' => '\\Bitrix\\Main\\Data\\CacheEngineMemcache',
+                                'extension' => 'memcache'
+                        ],
+                        'memcache' => [
+                                'host' => 'memcached',
+                                'port' => '11211',
+                        ]
+                ],
+                'sid' => $_SERVER["DOCUMENT_ROOT"]."#01234"
+        ],
+```
+
+вариант `redis` без пароля:
+
+```php
+        // cache on redis
+        'cache' => [
+                'value' => [
+                        'type' => [
+                                'class_name' => '\\Bitrix\\Main\\Data\\CacheEngineRedis',
+                                'extension' => 'redis'
+                        ],
+                        'redis' => [
+                                'host' => 'redis',
+                                'port' => '6379',
+                        ]
+                ],
+                'sid' => $_SERVER["DOCUMENT_ROOT"]."#01234"
+        ],
+```
+
+вариант `redis` с паролем (пароль из `confs/redis/redis.conf`, см. пункт 5.3):
+
+```php
+        // cache on redis with password
+        'cache' => [
+                'value' => [
+                        'type' => [
+                                'class_name' => '\\Bitrix\\Main\\Data\\CacheEngineRedis',
+                                'extension' => 'redis'
+                        ],
+                        'redis' => [
+                                'host' => 'redis',
+                                'port' => '6379',
+                                'password' => 'ВАШ_ПАРОЛЬ_REDIS',
+                        ]
+                ],
+                'sid' => $_SERVER["DOCUMENT_ROOT"]."#01234"
+        ],
+```
+
+**Хранение сессий**, вариант `memcache` (разделенная сессия):
+
+```php
+        // sessions on memcache (separated)
+        'session' => [
+                'value' => [
+                        'lifetime' => 14400,
+                        'mode' => 'separated',
+                        'handlers' => [
+                                'kernel' => 'encrypted_cookies',
+                                'general' => [
+                                        'type' => 'memcache',
+                                        'port' => '11211',
+                                        'host' => 'memcached',
+                                ],
+                        ],
+                ],
+        ],
+```
+
+вариант `redis`:
+
+```php
+        // sessions on redis
+        'session' => [
+                'value' => [
+                        'mode' => 'default',
+                        'handlers' => [
+                                'general' => [
+                                        'type' => 'redis',
+                                        'port' => '6379',
+                                        'host' => 'redis',
+                                        //'password' => 'ВАШ_ПАРОЛЬ_REDIS',
+                                ],
+                        ],
+                ],
+        ],
+```
+
+вариант `database`:
+
+```php
+        // sessions on database
+        'session' => [
+                'value' => [
+                        'mode' => 'default',
+                        'handlers' => [
+                                'general' => [
+                                        'type' => 'database',
+                                ],
+                        ],
+                ],
+        ],
+```
+
+Документация:
+- кеш: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&CHAPTER_ID=02795&LESSON_PATH=3913.3516.5062.2795#cache
+- сессии: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&LESSON_ID=14026
+
+**Альтернатива - модуль Веб-кластер (cluster)**, если он есть в редакции продукта:
+
+- `memcache`: на странице настроек модуля (`/bitrix/admin/settings.php?lang=ru&mid=cluster`) выбираем `Использовать для хранения кеша` - `Memcache`, затем на странице `Подключения к memcached` (`/bitrix/admin/cluster_memcache_list.php?lang=ru&group_id=1`) добавляем подключение: `Сервер` - `memcached`, `Порт` - `11211`, `Процент распределения нагрузки` - `100`, и нажимаем `Начать использовать`;
+- `redis`: выбираем `Использовать для хранения кеша` - `Redis`, на странице `Подключения к redis` (`/bitrix/admin/cluster_redis_list.php?lang=ru&group_id=1`) добавляем подключение: `Сервер` - `redis`, `Порт` - `6379`, и нажимаем `Начать использовать`.
+
+Проверить работу кеша можно в консоли сервиса:
+
+```bash
+docker compose exec --user=root redis sh -c "redis-cli -h 127.0.0.1 -p 6379 info keyspace"
+docker compose exec --user=root memcached sh -c "echo stats | nc 127.0.0.1 11211 | head -20"
+```
+
+<a id="step17"></a>
+## Шаг 17. Поиск через Sphinx
+
+Полнотекстовый поиск обслуживает контейнер `sphinx` (индекс типа `rt`, конфигурация - `confs/sphinx/sphinx.conf`).
+
+Настройка:
+- переходим в настройки модуля `Поиск` (`/bitrix/admin/settings.php?lang=ru&mid=search`);
+- вкладка `Морфология`:
+  - `Полнотекстовый поиск с помощью` - `Sphinx`;
+  - `Строка подключения для управления индексом (протокол MySql)` - `sphinx:9306`;
+  - `Идентификатор индекса` - `bitrix` (не меняем).
+
+Сохраняем настройки модуля.
+
+На странице `Переиндексация сайта` (`/bitrix/admin/search_reindex.php?lang=ru`) снимаем галку `Переиндексировать только измененные` и выполняем полную переиндексацию.
+
+> [!IMPORTANT]
+> После переезда переиндексация обязательна: индекс Sphinx не переносится вместе с файлами и базой, он пуст.
+
+Документация: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=35&CHAPTER_ID=04507&LESSON_PATH=3906.4507
+
+<a id="step18"></a>
+## Шаг 18. Финальный чек-лист
+
+Проверяем перед тем, как считать переезд завершенным:
+
+- [ ] все контейнеры в состоянии `Up`: `docker compose ps`;
+- [ ] в логах нет повторяющихся ошибок: `docker compose logs --tail=100`;
+- [ ] публичная часть сайта открывается, картинки и файлы из `/upload/` отдаются;
+- [ ] административная часть открывается, авторизация работает;
+- [ ] количество таблиц и пользователей в базе совпадает с исходным (пункт 8.4);
+- [ ] `Проверка системы` (`/bitrix/admin/site_checker.php?lang=ru`) - без критичных ошибок;
+- [ ] в настройках главного модуля указан правильный `URL сайта`;
+- [ ] агенты выполняются на cron: `/bitrix/admin/agent_list.php?lang=ru`;
+- [ ] почта уходит (тест в `Проверке системы` или письмо самому себе);
+- [ ] поиск работает после полной переиндексации;
+- [ ] служебные скрипты (`bitrix_server_test.php`, `bitrixsetup.php`, `restore.php`) удалены из корня сайта;
+- [ ] архив сайта и дамп базы удалены из контейнеров (`/tmp`), но сохранены в надежном месте вне хоста;
+- [ ] настроено регулярное резервное копирование (см. [Часть 4](#part4)).
+
+<a id="part3"></a>
+# Часть 3. Установка сайта с нуля
+
+Если переносить нечего и сайт разворачивается заново, шаги 1-3 и 7-10 заменяются на этот раздел. Шаги 4-6 (подготовка сборки и запуск контейнеров) и 12-18 (настройка, cron, почта, кеш, поиск, проверка) выполняются как описано выше.
+
+<a id="bitrixsetupphprestorephp"></a>
+## BitrixSetup / Restore
+
+Для установки продуктов 1С-Битрикс используется скрипт `bitrixsetup.php`, для восстановления из резервной копии, созданной средствами Битрикс, - `restore.php`.
+
+Документация:
+- `bitrixsetup.php`: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=135&LESSON_ID=4523&LESSON_PATH=10495.4495.4523
+- `restore.php`: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=135&CHAPTER_ID=02014&LESSON_PATH=10495.4496.2014
+
+Скачиваем нужный скрипт в корень сайта:
+
+```bash
+docker compose exec --user=bitrix php sh -c "cd /opt/www && wget https://www.1c-bitrix.ru/download/scripts/bitrixsetup.php"
+```
+
+```bash
+docker compose exec --user=bitrix php sh -c "cd /opt/www && wget https://www.1c-bitrix.ru/download/scripts/restore.php"
+```
+
+Открываем в браузере:
+
+```bash
+https://site.example.com/bitrixsetup.php
+https://site.example.com/restore.php
+```
+
+<a id="installdistro"></a>
+## Установка дистрибутива
+
+Через `bitrixsetup.php` скачиваем дистрибутив продукта (демо или лицензионную версию), затем открываем сайт:
+
+```bash
+https://site.example.com/
+```
+
+и проходим мастер установки. На шаге создания базы указываем:
+- `Имя хоста (алиас)` - `mysql`
+- `Имя суперпользователя` - `root`
+- `Пароль суперпользователя` - значение из файла `.env_sql` (см. пункт 5.2)
+
+Документация по мастеру установки: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=135&CHAPTER_ID=04522&LESSON_PATH=10495.4495.4522
+
+> [!NOTE]
+> Мастер создаст базу от имени `root`. Для боевой эксплуатации после установки создайте отдельного пользователя базы с правами только на базу сайта (команды - в пункте 8.1) и укажите его в `/bitrix/.settings.php` и `/bitrix/php_interface/dbconn.php`.
+
+<a id="restorebackup"></a>
+## Восстановление из резервной копии Битрикс
+
+Через `restore.php` восстанавливаем сайт из резервной копии, созданной модулем `Резервное копирование`:
+- копия на стороннем сайте - вариант `Скачать резервную копию с другого сайта`, указываем путь к архиву;
+- копия в облаке 1С-Битрикс - вариант `Развернуть резервную копию из облака "1С-Битрикс"`, указываем активный лицензионный ключ;
+- копия на вашем компьютере - вариант `Загрузить с локального диска`;
+- копия уже лежит в корне сайта - появится пункт `Архив загружен в корневую папку сервера`.
+
+Загрузить архив в корень сайта можно так:
+
+```bash
+docker compose cp .\backup.tar.gz php:/opt/www/backup.tar.gz
+docker compose exec --user=root php sh -c "chown bitrix:bitrix /opt/www/backup.tar.gz"
+```
+
+После распаковки файлов скрипт запросит параметры подключения к базе: хост - `mysql`, пользователь и база - те, что созданы в пункте 8.1 (или `root` с паролем из `.env_sql`).
+
+Нажимаем `Восстановить` и дожидаемся завершения. После успешного восстановления нажимаем `Удалить локальную копию и служебные скрипты`.
+
+Далее возвращаемся к [Шагу 10](#step10) - очистка настроек старого окружения нужна и в этом случае.
+
+<a id="part4"></a>
+# Часть 4. Регулярное резервное копирование
+
+Сайт переехал - теперь резервные копии нужно снимать уже с этой сборки. Рабочая схема состоит из трех независимых частей: копия средствами Битрикс, отдельный дамп базы и копия томов Docker.
+
+> [!CAUTION]
+> Внимание! Резервные копии нужно хранить вне хоста, на котором работает сайт. Копия, лежащая в каталоге `www/` рядом с сайтом, не защищает ни от отказа диска, ни от ошибочного удаления каталога.
+
+<a id="backupbybitrix"></a>
+## Бекап средствами Битрикс по cron
+
+Модуль `Резервное копирование` создает архив файлов и дамп базы в каталоге `/bitrix/backup/` и умеет выгружать его в облако 1С-Битрикс.
+
+Настраиваем ежедневный запуск в контейнере `cron`. Заходим в его консоль под `root`:
+
+```bash
+docker compose exec --user=root cron sh
+```
+
+Ставим редактор и создаем задание `/etc/periodic/daily/backup` (без расширения):
+
+```bash
+apk add mc
+mcedit /etc/periodic/daily/backup
+```
+
+Содержимое файла:
+
+```bash
+#!/bin/sh
+#
+su - bitrix -c 'php -f /opt/www/bitrix/modules/main/tools/backup.php; > /dev/null 2>&1'
+#
+```
+
+Делаем задание исполняемым и просим `crond` перечитать задания:
+
+```bash
+chmod -R a+x /etc/periodic/daily
+touch /etc/crontabs/cron.update
+exit
+```
+
+Итог: раз в сутки (в 2 часа ночи) выполняется резервное копирование. Детали видны в логе контейнера:
+
+```bash
+docker compose logs --tail=50 cron
+```
+
+Пример вывода:
+
+```
+0.19 sec	Backup started to file: /opt/www/bitrix/backup/20250423_113000_full_vnw0wuf76rq6e5je.tar
+0.19 sec	Dumping database
+14.18 sec	Archiving database dump
+14.2 sec	Archiving files
+167.01 sec	Finished.
+Data size: 2569.42 M
+Archive size: 2569.42 M
+Time: 166.76 sec
+```
+
+Параметры копирования (что включать, куда выгружать, сколько копий хранить) задаются на странице `Резервное копирование` (`/bitrix/admin/dump.php?lang=ru`).
+
+Документация: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=35&LESSON_ID=4464&LESSON_PATH=3906.4833.4464
+
+> [!IMPORTANT]
+> Задание, созданное внутри контейнера, живет только до его пересоздания. После `docker compose down`/`up` или смены версии PHP задание нужно создать заново. Если такое поведение неудобно - используйте способ с дампом с хоста (ниже), он не зависит от жизненного цикла контейнеров.
+
+<a id="backupmysqldump"></a>
+## Дамп базы данных с хоста
+
+Независимый от Битрикс способ. Команда выполняется внутри контейнера `mysql`, дамп складывается в каталог `/var/log/mysql` (том `dev_mysql_log_data`), после чего забирается на хост:
+
+```bash
+docker compose exec mysql bash -c "mysqldump -u root -p'ПАРОЛЬ_ROOT' --single-transaction --quick --hex-blob --routines --triggers --events --default-character-set=utf8mb4 --set-gtid-purged=OFF --no-tablespaces sitemanager | gzip -1 > /var/log/mysql/db_backup.sql.gz"
+```
+
+```bash
+docker compose cp mysql:/var/log/mysql/db_backup.sql.gz .\db_backup.sql.gz
+docker compose exec mysql bash -c "rm -f /var/log/mysql/db_backup.sql.gz"
+```
+
+Проверяем полученный дамп так же, как в пункте 2.4 - последняя строка должна содержать `Dump completed`.
+
+Для автоматического запуска оформляем эти команды скриптом и ставим в планировщик хоста: `cron` на Linux, `Планировщик заданий` на Windows.
+
+<a id="backupvolumes"></a>
+## Резервная копия файлов сайта и томов Docker
+
+**Файлы сайта** лежат в каталоге `www/` и архивируются обычным `tar` на хосте, без остановки контейнеров:
+
+- Linux/macOS:
+```bash
+tar -czf ./www_$(date +%Y%m%d).tar.gz \
+  --exclude='./bitrix/cache/*' --exclude='./bitrix/managed_cache/*' \
+  --exclude='./bitrix/stack_cache/*' --exclude='./upload/resize_cache/*' \
+  -C ./www .
+```
+
+- Windows PowerShell:
+```powershell
+tar -czf ".\www_$(Get-Date -Format yyyyMMdd).tar.gz" --exclude="./bitrix/cache/*" --exclude="./bitrix/managed_cache/*" --exclude="./bitrix/stack_cache/*" --exclude="./upload/resize_cache/*" -C .\www .
+```
+
+Так же каталог `www/` можно включить в любую штатную систему бекапа хоста - это обычные файлы.
+
+**Тома Docker** (база, `.bx_temp`, msmtp, browscap, geoip2) архивируются через временный контейнер. Останавливаем контейнеры, чтобы данные не менялись во время копирования:
+
+```bash
+docker compose stop
+```
+
+Архивируем том базы (`dev` - значение `COMPOSE_PROJECT_NAME`):
+
+- Linux/macOS:
+```bash
+docker run --rm -v dev_mysql_lib_data:/data -v "$PWD":/backup alpine:3.23 tar -czf /backup/mysql_lib_data.tar.gz -C /data .
+```
+
+- Windows PowerShell:
+```powershell
+docker run --rm -v dev_mysql_lib_data:/data -v "${PWD}:/backup" alpine:3.23 tar -czf /backup/mysql_lib_data.tar.gz -C /data .
+```
+
+Запускаем контейнеры обратно:
+
+```bash
+docker compose up -d
+```
+
+Восстановление тома выполняется обратной командой (том должен быть пустым):
+
+```bash
+docker run --rm -v dev_mysql_lib_data:/data -v "$PWD":/backup alpine:3.23 sh -c "cd /data && tar -xzf /backup/mysql_lib_data.tar.gz"
+```
+
+> [!CAUTION]
+> Внимание! Архив тома `dev_mysql_lib_data` - это копия файлов базы "как есть". Снимать его на работающем контейнере `mysql` нельзя: копия будет несогласованной. Либо останавливаем контейнеры, либо пользуемся дампом `mysqldump`.
+
+<a id="backuprestoretest"></a>
+## Проверка восстановления
+
+Резервная копия, из которой ни разу не восстанавливались, резервной копией не считается. Раз в квартал разумно проделать учебное восстановление:
+
+1. копируем сборку в отдельный каталог, в `.env` меняем `COMPOSE_PROJECT_NAME` (например, на `test`) и `SITE_DOMAIN` (например, на `test.example.com`) - иначе роутеры Traefik и имена контейнеров конфликтуют с боевыми;
+2. поднимаем контейнеры: `docker compose up -d`;
+3. разворачиваем последние копии по шагам 7-11 этой инструкции;
+4. проверяем, что сайт открывается и данные на месте;
+5. удаляем тестовое окружение: `docker compose down -v` и удаляем каталог копии.
+
+<a id="part5"></a>
+# Часть 5. Справочник по окружению
+
+<a id="management"></a>
+## Управление контейнерами
+
+Все команды выполняются из каталога проекта.
+
+Запустить все контейнеры в фоне:
+```bash
+docker compose up -d
+```
+
+Список контейнеров и их статус:
+```bash
+docker compose ps
+```
+
+Логи всех контейнеров / одного сервиса:
+```bash
+docker compose logs
+docker compose logs --tail=100 -f nginx
+```
+
+Перезапустить один контейнер или все:
+```bash
+docker compose restart nginx
+docker compose restart
+```
+
+Остановить все контейнеры (данные сохраняются):
+```bash
+docker compose stop
+```
+
+Остановить и удалить контейнеры (тома сохраняются):
+```bash
+docker compose down
+```
+
+Остановить, удалить контейнеры **и удалить все тома** (сайт и база будут потеряны):
+```bash
+docker compose down -v
+```
+
+Зайти в sh-консоль контейнера:
+```bash
+docker compose exec nginx sh
+```
+
+Использование отдельного compose-файла:
+```bash
+docker compose -f docker-compose-test.yml ps
+```
+
+Документация: https://docs.docker.com/reference/cli/docker/compose/
+
+<a id="traefik"></a>
+## Публикация через Traefik
+
+Схема: клиент -> Traefik (порты `80`/`443` хоста, терминирует TLS) -> сеть `proxy` -> контейнер `dev_nginx`, порт `80` -> `php-fpm`.
+
+Сервис `nginx` подключен к двум сетям: внутренней `dev` (там же база, php, redis и т.д.) и внешней сети Traefik (`proxy`). Наружу порт не публикуется, поэтому сайт доступен только через прокси.
+
+### Что нужно со стороны Traefik
+
+- Traefik запущен и подключен к той же внешней сети, что указана в `TRAEFIK_NETWORK`;
+- у Traefik настроены entrypoints `web` (`:80`) и `websecure` (`:443`);
+- настроен certresolver с именем из `TRAEFIK_CERTRESOLVER` (по умолчанию `le`);
+- включен docker provider (`--providers.docker`), Traefik читает labels контейнеров.
+
+Если сети еще нет:
+
+```bash
+docker network create proxy
+```
+
+### Параметры сборки
+
+В файле `.env`:
+
+```bash
+SITE_DOMAIN=site.example.com
+TRAEFIK_NETWORK=proxy
+TRAEFIK_CERTRESOLVER=le
+```
+
+Labels сервиса `nginx` в `docker-compose.yml` (имена роутеров формируются из `COMPOSE_PROJECT_NAME`, поэтому несколько сайтов на одном хосте не конфликтуют):
+
+```yaml
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-proxy}"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}.rule=Host(`${SITE_DOMAIN}`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}.entrypoints=websecure"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}.tls.certresolver=${TRAEFIK_CERTRESOLVER:-le}"
+      - "traefik.http.services.${COMPOSE_PROJECT_NAME:-dev}.loadbalancer.server.port=80"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}-http.rule=Host(`${SITE_DOMAIN}`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}-http.entrypoints=web"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-dev}-http.middlewares=${COMPOSE_PROJECT_NAME:-dev}-https"
+      - "traefik.http.middlewares.${COMPOSE_PROJECT_NAME:-dev}-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.${COMPOSE_PROJECT_NAME:-dev}-https.redirectscheme.permanent=true"
+```
+
+Проверить, во что развернулись переменные, можно без запуска контейнеров:
+
+```bash
+docker compose config
+```
+
+### Что настроено в nginx для работы за прокси
+
+Прокси терминирует TLS, поэтому до сайта запрос доходит по `http`. Чтобы Битрикс не строил ссылки и редиректы на `http` (иначе получаем цикл редиректов) и видел реальный IP клиента, в сборку добавлены:
+
+```bash
+confs/nginx/maps/proxy_scheme.conf  - карты $bx_https, $bx_scheme, $bx_server_port из заголовков X-Forwarded-*
+confs/nginx/inc/proxy_params.conf   - fastcgi_param HTTPS / REQUEST_SCHEME / SERVER_PORT, подключается после fastcgi_params
+confs/nginx/inc/real_ip.conf        - set_real_ip_from для частных сетей + real_ip_header X-Forwarded-For
+```
+
+Файл `proxy_params.conf` подключен во всех трех php-локациях (`~ \.php$`, `@php`, `@bitrix`) файла `confs/nginx/conf.d/default.conf` **после** `include fastcgi_params;` - порядок важен, значения переопределяются последним включением.
+
+Проверить, что сайт видит https, можно так:
+
+```bash
+docker compose exec nginx sh -c "wget -q -O /dev/null -H 'X-Forwarded-Proto: https' http://127.0.0.1/ && echo request OK"
+```
+
+и в самом продукте - в `Проверке системы` не должно быть замечаний по протоколу, а ссылки в письмах и редиректы должны быть на `https://`.
+
+### Порты сервисов
+
+Внутри контейнера `nginx` слушает:
+- `80` - сайт, на него Traefik проксирует запросы;
+- `8893` - служебный HTTP-сервер (заглушка).
+
+Порты остальных сервисов (`3306` mysql, `6379` redis, `11211` memcached, `9000` php-fpm, `9306`/`9312` sphinx) доступны только внутри сети `dev`. В `docker-compose.yml` они закомментированы - это осознанное решение по безопасности, открывайте их только при реальной необходимости (например, для подключения внешним SQL-клиентом на время отладки).
+
+Для работы без Traefik раскомментируйте у сервиса `nginx` блок `ports` (`"8588:80"`) - сайт станет доступен по `http://IP_хоста:8588/`.
+
+<a id="worksitefolder"></a>
+## Работа с файлами сайта из папки
+
+Корень сайта - каталог `www/` репозитория, подключенный как `/opt/www` в контейнеры `php`, `cron` и `nginx`:
+
+```yaml
+    volumes:
+      - ./www/:/opt/www/
+```
+
+Это обычный bind mount: правки файлов с хоста видны в контейнерах сразу, перезапуск не нужен. Можно открыть `www/` в IDE, вести git-репозиторий сайта, запускать линтеры и сборщики фронтенда прямо на хосте.
+
+### Права доступа
+
+Внутри контейнеров процессы работают от пользователя `bitrix` с `uid:gid = 979:979` (задано в `sources/bxphp*/Dockerfile` и `sources/bxnginx*/Dockerfile`).
+
+- **Linux-хост**: владелец файлов на хосте и в контейнере - один и тот же числовой uid. Чтобы сайт мог писать в свои каталоги:
+```bash
+sudo chown -R 979:979 ./www
+```
+Чтобы при этом файлы оставались доступными вашему пользователю на запись, добавьте себя в группу `979` или используйте `setfacl`.
+
+- **Windows + Docker Desktop**: права на файлах Windows-диска не отображаются в Linux-контейнер напрямую, все файлы видны как доступные - `chown` не требуется.
+
+- **macOS + Docker Desktop**: работает через VirtioFS/gRPC-FUSE с автоматическим маппингом владельца, `chown` обычно не требуется.
+
+Проверка, что сайт может писать в каталог:
+
+```bash
+docker compose exec --user=bitrix php sh -c "touch /opt/www/.write_test && rm /opt/www/.write_test && echo write OK"
+```
+
+### Производительность на Windows
+
+Bind mount в каталог на диске `C:` работает заметно медленнее, чем том Docker: Битрикс делает тысячи обращений к файлам на хит. Если сайт открывается медленно:
+
+- перенесите проект в файловую систему WSL2 (например, `\\wsl$\Ubuntu\home\user\env-docker`) и работайте с ним оттуда - разница обычно кратная;
+- либо оставьте `www/` bind mount только для разработки, а для нагрузочных проверок временно верните том.
+
+### Возврат к тому Docker
+
+Если понадобится вернуть прежнюю схему, в `docker-compose.yml` возвращаем том в трех сервисах (`php`, `cron`, `nginx`):
+
+```yaml
+      - www_data:/opt/www/
+```
+
+и объявляем его в разделе `volumes`:
+
+```yaml
+  www_data:
+    driver: local
+```
+
+### Перенос данных из старого тома в папку
+
+Если сайт уже работал на томе `dev_www_data`, содержимое переносится так:
+
+```bash
+docker compose stop
+```
+
+- Linux/macOS:
+```bash
+docker run --rm -v dev_www_data:/from -v "$PWD/www":/to alpine:3.23 sh -c "cd /from && cp -a . /to"
+```
+
+- Windows PowerShell:
+```powershell
+docker run --rm -v dev_www_data:/from -v "${PWD}/www:/to" alpine:3.23 sh -c "cd /from && cp -a . /to"
+```
+
+```bash
+docker compose up -d
+```
+
+Проверяем, что сайт открывается, и только после этого удаляем старый том:
+
+```bash
+docker volume rm dev_www_data
+```
+
+<a id="servicesconsole"></a>
+## Консоль сервисов
+
+Общий шаблон входа в консоль контейнера:
+
+```bash
+docker compose exec [--user=[пользователь]] [сервис] [оболочка]
+```
+
+Где:
+- `пользователь` - `bitrix` или `root`; если не указывать, берется поведение по умолчанию;
+- `сервис` - имя сервиса из `docker-compose.yml`: `nginx`, `php`, `cron`, `mysql`, `redis`, `memcached`, `sphinx`;
+- `оболочка` - `sh`, `bash`, `ash`.
+
+Примеры:
+
+```bash
+docker compose exec mysql bash
+docker compose exec --user=bitrix php sh
+docker compose exec --user=root php sh
+docker compose exec --user=root redis sh -c "id"
+```
+
+**MySQL** - консоль базы из-под `root`:
+
+```bash
+docker compose exec mysql bash -c "mysql -u root -p"
+```
+
+Пароль - из файла `.env_sql`. Выход - `exit`.
+
+**Memcache**:
+
+```bash
+docker compose exec --user=root memcached sh -c "nc 127.0.0.1 11211"
+```
+
+Выполняем запросы (например, `stats`). Выход - `exit`.
+
+**Redis**:
+
+```bash
+docker compose exec --user=root redis sh -c "redis-cli -h 127.0.0.1 -p 6379"
+```
+
+Выполняем запросы (например, `ping` или `KEYS *`). Выход - `exit`.
+
+**Sphinx** (индекс доступен по протоколу MySQL):
+
+```bash
+docker compose exec --user=root sphinx sh -c "mysql -h 127.0.0.1 -P 9306 -e 'SHOW TABLES;'"
+```
+
 <a id="php"></a>
-# PHP
+## PHP
 
-<a id="phpcomposer"></a>
-## PHP Composer
+### Composer
 
-В контейнере с `php` по умолчанию доступен [PHP Composer](https://getcomposer.org/).
+В контейнере `php` доступен [PHP Composer](https://getcomposer.org/).
 
-Предварительно в административной части продукта на странице `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`) отредактируем файл `/bitrix/.settings.php`, добавляем блок настроек:
+Предварительно в файл `/opt/www/bitrix/.settings.php` добавляем блок:
 
 ```php
         'composer' => [
@@ -960,222 +1640,107 @@ function custom_mail($to, $subject, $message, $additional_headers='', $additiona
         ],
 ```
 
-Чтобы его использовать, заходим в sh-консоль контейнера `php` из-под пользователя `bitrix`:
+Заходим в консоль контейнера и работаем:
+
 ```bash
 docker compose exec --user=bitrix php sh
-```
-
-Проверяем его версию командой:
-```bash
 composer --version
-```
-
-Устанавливаем зависимости:
-```bash
 cd /opt/www/bitrix/
 COMPOSER=composer-bx.json composer install
-```
-
-После запускаем Bitrix CLI:
-```bash
 php bitrix.php -h
 ```
 
-Полный набор команд и параметров доступен в документации: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&LESSON_ID=11685&LESSON_PATH=3913.3516.4776.2483.11685
+Документация: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&LESSON_ID=11685&LESSON_PATH=3913.3516.4776.2483.11685
 
-<a id="phpbrowsercapabilities"></a>
-## PHP Browser Capabilities
+### Browser Capabilities
 
-Возможно, пригодится настроить, если нужна `История входов`: https://helpdesk.bitrix24.ru/open/16615982/
+Нужна для `Истории входов` (https://helpdesk.bitrix24.ru/open/16615982/).
 
-Заходим в sh-консоль контейнера `php` из-под пользователя `root`:
+Под `root` подключаем ini-файл:
+
 ```bash
-docker compose exec --user=root php sh
+docker compose exec --user=root php sh -c "apk add curl && echo 'browscap = /opt/browscap/php_browscap.ini' > /usr/local/etc/php/conf.d/browscap.ini"
 ```
 
-Устанавливаем `curl`, подключаем ini-файл в настройках PHP, выходим:
+Под `bitrix` загружаем базу в том `dev_browscap_data`:
+
 ```bash
-apk add curl
-echo 'browscap = /opt/browscap/php_browscap.ini' > /usr/local/etc/php/conf.d/browscap.ini
-exit
+docker compose exec --user=bitrix php sh -c "cd /opt/browscap && curl http://browscap.org/stream?q=PHP_BrowsCapINI -o php_browscap.ini"
 ```
 
-Заходим в sh-консоль контейнера `php` из-под пользователя `bitrix`:
-```bash
-docker compose exec --user=bitrix php sh
-```
+Перезапускаем контейнеры:
 
-В каталог `/opt/browscap` загрузим `browscap.ini`. Выполняем:
-```bash
-cd /opt/browscap
-curl http://browscap.org/stream?q=PHP_BrowsCapINI -o php_browscap.ini
-exit
-```
-
-Перезапускаем контейнеры `php` и `cron`:
 ```bash
 docker compose restart php cron
 ```
 
-На странице настроек `Главного модуля (main)` (`/bitrix/admin/settings.php?lang=ru&mid=main`) на вкладке `Журнал событий`:
-- отмечаем опцию `Сохранять историю входов с устройств пользователя` - `Да`
-- заполняем поле `Сколько дней хранить историю входов` - `365`
+В настройках `Главного модуля (main)` на вкладке `Журнал событий` включаем `Сохранять историю входов с устройств пользователя` и задаем срок хранения.
 
-Сохраняем настройки.
+### GeoIP2
 
-<a id="phpgeoip2"></a>
-## PHP GeoIP2
+Нужна для геопозиции в `Истории входов`.
 
-Возможно, пригодится настроить, если нужно отслеживать геопозицию устройства для `Истории входов`: https://helpdesk.bitrix24.ru/open/16615982/
+Размещаем файлы `GeoLite2-ASN.mmdb`, `GeoLite2-City.mmdb`, `GeoLite2-Country.mmdb` в каталоге `/opt/geoip2` (том `dev_geoip2_data`):
 
-Заходим в sh-консоль контейнера `php` из-под пользователя `bitrix`:
 ```bash
-docker compose exec --user=bitrix php sh
+docker compose cp .\GeoLite2-City.mmdb php:/opt/geoip2/GeoLite2-City.mmdb
+docker compose exec --user=root php sh -c "chown -R bitrix:bitrix /opt/geoip2"
 ```
 
-Переходим в каталог `/opt/geoip2`:
+На странице `Список обработчиков геолокации` (`/bitrix/admin/geoip_handlers_list.php?lang=ru`) редактируем обработчик `GeoIP2`, на вкладке `Дополнительные` указываем тип базы и абсолютный путь к файлу, например `/opt/geoip2/GeoLite2-City.mmdb`.
+
+В настройках `Главного модуля (main)` на вкладке `Журнал событий` включаем `Собирать IP-геоданные для истории входов`.
+
+### Расширения (extensions)
+
+Образ `bitrix24/php` содержит расширения:
+
 ```bash
-cd /opt/geoip2
+amqp apcu bz2 calendar exif gd gettext igbinary imagick intl ldap mcrypt
+memcache memcached msgpack mysqli opcache pdo_mysql pdo_pgsql pgsql pspell
+redis shmop sockets sodium ssh2 sysvmsg sysvsem sysvshm xdebug xhprof
+xml xmlwriter xsl zip
 ```
 
-Размещаем в нем файлы в формате mmdb, список:
+Большинство активны по умолчанию. Для включения или выключения правим файл `/usr/local/etc/php/conf.d/docker-php-ext-***.ini`, где `***` - название расширения:
+
 ```bash
-GeoLite2-ASN.mmdb
-GeoLite2-City.mmdb
-GeoLite2-Country.mmdb
+docker compose exec --user=root php sh -c "apk add mc"
+docker compose exec --user=root php sh -c "mcedit /usr/local/etc/php/conf.d/docker-php-ext-imagick.ini"
 ```
 
-На странице `Список обработчиков геолокации` (`/bitrix/admin/geoip_handlers_list.php?lang=ru`) редактируем обработчик `GeoIP2` (`/bitrix/admin/geoip_handler_edit.php?lang=ru&ID=1&CLASS_NAME=%5CBitrix%5CMain%5CService%5CGeoIp%5CGeoIP2`).
-
-На вкладке `Дополнительные`:
-- выбираем `Тип базы данных` - `GeoIP2/GeoLite2 City`
-- заполняем `Абсолютный путь к файлу базы данных (*.mmdb)` - `/opt/geoip2/GeoLite2-City.mmdb`
-
-или
-
-- выбираем `Тип базы данных` - `GeoIP2/GeoLite2 Country`
-- заполняем `Абсолютный путь к файлу базы данных (*.mmdb)` - `/opt/geoip2/GeoLite2-Country.mmdb`
-
-Сохраняем настройки.
-
-На странице настроек `Главного модуля (main)` (`/bitrix/admin/settings.php?lang=ru&mid=main`) на вкладке `Журнал событий`:
-- отмечаем опцию `Собирать IP-геоданные для истории входов` - `Да`
-
-Сохраняем настройки.
-
-<a id="phpextensions"></a>
-## PHP расширения (extensions)
-
-Образ `bitrix24/php` в своем составе содержит следующие PHP расширения (extensions):
-```bash
-amqp
-apcu
-bz2
-calendar
-exif
-gd
-gettext
-igbinary
-imagick
-intl
-ldap
-mcrypt
-memcache
-memcached
-msgpack
-mysqli
-opcache
-pdo_mysql
-pdo_pgsql
-pgsql
-pspell
-redis
-shmop
-sockets
-sodium
-ssh2
-sysvmsg
-sysvsem
-sysvshm
-xdebug
-xhprof
-xml
-xmlwriter
-xsl
-zip
-```
-
-Большинство из них активны по умолчанию.
-
-Чтобы активировать PHP расширение:
-
-- заходим в sh-консоль контейнера `php` из-под пользователя `root`:
-```bash
-docker compose exec --user=root php sh
-```
-
-- находим файл `/usr/local/etc/php/conf.d/docker-php-ext-***.ini`, где `***` название расширения, пример для `imagick`:
-```bash
-apk add mc
-mcedit /usr/local/etc/php/conf.d/docker-php-ext-imagick.ini
-```
-
-- внутри файла меняем строку активируем подключение: `extension=***.so`, где `***` название расширения:
+Включено:
 ```bash
 extension=imagick.so
 ```
 
-- сохраняем изменения и выходим
-
-- перезапускаем контейнеры `php` и `cron`:
-```bash
-docker compose restart php cron
-```
-
-Чтобы  деактивировать PHP расширение:
-
-- заходим в sh-консоль контейнера `php` из-под пользователя `root`:
-```bash
-docker compose exec --user=root php sh
-```
-
-- находим файл `/usr/local/etc/php/conf.d/docker-php-ext-***.ini`, где `***` название расширения, пример для `imagick`:
-```bash
-apk add mc
-mcedit /usr/local/etc/php/conf.d/docker-php-ext-imagick.ini
-```
-
-- внутри файла меняем строку деактивируем подключение: `; extension=***.so`, где `***` название расширения:
+Выключено:
 ```bash
 ; extension=imagick.so
 ```
 
-- сохраняем изменения и выходим
-- перезапускаем контейнеры `php` и `cron`:
+После правки перезапускаем контейнеры:
+
 ```bash
 docker compose restart php cron
 ```
 
-<a id="phpimagickimageengine"></a>
-## PHP Imagick Engine для изображений
+Проверить список активных расширений:
 
-Чтобы работать с изображениями с помощью PHP расширения `Imagick` (а не `GD`), активируем библиотеку для работы с изображениями на базе `ImagickImageEngine`.
-
-Убедимся, что в файле `/usr/local/etc/php/conf.d/docker-php-ext-imagick.ini` активировано подключение расширения `imagick`. Как это сделать, описано в главе PHP [Расширения (extensions)](#phpextensions).
-
-Заходим в sh-консоль контейнера `php` из-под пользователя `bitrix`:
 ```bash
-docker compose exec --user=bitrix php sh
+docker compose exec --user=bitrix php sh -c "php -m"
 ```
 
-Выполняем команду:
+### Imagick Engine для изображений
+
+Чтобы работать с изображениями через `Imagick`, а не `GD`, убеждаемся, что расширение `imagick` включено, и копируем изображение-заглушку:
+
 ```bash
-\cp /usr/local/etc/image.png /opt/www/bitrix/images/
+docker compose exec --user=bitrix php sh -c "\cp /usr/local/etc/image.png /opt/www/bitrix/images/"
 ```
 
-В административной части продукта:
-- на странице `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`) редактируем файл `/bitrix/.settings.php`
-- добавляем блок настроек:
+В файл `/opt/www/bitrix/.settings.php` добавляем блок:
+
 ```php
         'services' => [
                 'value' => [
@@ -1202,1763 +1767,203 @@ docker compose exec --user=bitrix php sh
         ],
 ```
 
-Сохраняем файл.
+Для отключения удаляем этот блок.
 
-Для выключения в административной части продукта на странице `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`) отредактируем файл `/bitrix/.settings.php` и уберем блок настроек выше.
+### Веб-антивирус
 
-<a id="phpsecurityantivirus"></a>
-## PHP веб-антивирус
+Веб-антивирус входит в модуль `Проактивная защита (security)`. Для детектирования вирусов, внедренных до старта буферизации вывода, добавляем ini-файл:
 
-Веб-антивирус включен в состав модуля `Проактивная защита (security)`, с помощью которого реализуется целый комплекс защитных мероприятий для сайта и сторонних приложений.
-
-Для детектирования вирусов, внедренных до старта буферизации вывода, добавим в контейнер `php` файл `/usr/local/etc/php/conf.d/security.ini`.
-
-Заходим в sh-консоль контейнера `php` из-под пользователя `root`:
 ```bash
-docker compose exec --user=root php sh
-```
-
-Выполняем команду:
-```bash
-echo "auto_prepend_file = /opt/www/bitrix/modules/security/tools/start.php" > /usr/local/etc/php/conf.d/security.ini
-```
-
-Перезапускаем контейнеры `php` и `cron`:
-```bash
+docker compose exec --user=root php sh -c "echo 'auto_prepend_file = /opt/www/bitrix/modules/security/tools/start.php' > /usr/local/etc/php/conf.d/security.ini"
 docker compose restart php cron
 ```
 
-На странице `Веб-антивирус` (`/bitrix/admin/security_antivirus.php?lang=ru`) включаем его, нажимаем кнопку `Включить веб-антивирус`.
+Включаем его на странице `Веб-антивирус` (`/bitrix/admin/security_antivirus.php?lang=ru`).
 
-Для выключения обратный порядок действий.
+Для отключения - обратный порядок: выключаем на странице модуля, затем
 
-На странице `Веб-антивирус` (`/bitrix/admin/security_antivirus.php?lang=ru`) выключаем его, нажимаем кнопку `Выключить веб-антивирус`.
-
-Заходим в sh-консоль контейнера `php` из-под пользователя `root`:
 ```bash
-docker compose exec --user=root php sh
-```
-
-Выполняем команду:
-```bash
-rm -f /usr/local/etc/php/conf.d/security.ini
-```
-
-Перезапускаем контейнеры `php` и `cron`:
-```bash
+docker compose exec --user=root php sh -c "rm -f /usr/local/etc/php/conf.d/security.ini"
 docker compose restart php cron
 ```
 
-Документация:
-https://dev.1c-bitrix.ru/user_help/settings/security/security_antivirus.php
-https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=35&LESSON_ID=2674#antivirus
+Документация: https://dev.1c-bitrix.ru/user_help/settings/security/security_antivirus.php
 
-<a id="phprouting"></a>
-## Роутинг
+### Роутинг
 
-Для запуска новой системы роутинга нужно перенаправить обработку 404 ошибок на файл `/bitrix/routing_index.php` в конфигурации контейнера `nginx`.
+Новая система роутинга требует, чтобы обработка 404 шла на файл `/bitrix/routing_index.php`.
 
-Сделать это можно двумя способами:
-- до первого запуска проекта в файле `confs/nginx/conf.d/default.conf` репозитория
-- если сайт уже запущен - в файле `/etc/nginx/conf.d/default.conf` контейнера `nginx`
+До первого запуска правим файл `confs/nginx/conf.d/default.conf` на хосте, у запущенного сайта - `/etc/nginx/conf.d/default.conf` внутри контейнера `nginx`.
 
-<a id="phproutingbeforestart"></a>
-### Включение роутинга до запуска сайта
+Включение роутинга - комментируем строки с `urlrewrite.php`, раскомментируем строки с `routing_index.php`:
 
-До первого запуска проекта редактируем файл `confs/nginx/conf.d/default.conf`.
-
-Находим в файле все строки содержащие `urlrewrite.php`. Добавляем `#` в начало таких строк. Ниже в строках с`routing_index.php` убираем `#`:
 ```bash
 #fastcgi_param SCRIPT_FILENAME $document_root/bitrix/urlrewrite.php;
 fastcgi_param SCRIPT_FILENAME $document_root/bitrix/routing_index.php;
 ```
 
-Запускаем все контейнеры, оставляем их работать в фоне:
-```bash
-docker compose up -d
-```
+Отключение - обратные действия:
 
-Новая система роутинга запущена.
-
-Документация: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&CHAPTER_ID=013764&LESSON_PATH=3913.3516.5062.13764
-
-<a id="phproutingafterstart"></a>
-### Включение или отключение роутинга для запущенного сайта
-
-Заходим в sh-консоль контейнера `nginx` из-под пользователя `root`:
-```bash
-docker compose exec --user=root nginx sh
-```
-
-Выполняем:
-```bash
-apk add mc
-exit
-```
-
-Заходим в sh-консоль контейнера `nginx` из-под пользователя `bitrix`:
-```bash
-docker compose exec --user=bitrix nginx sh
-```
-
-Редактируем файл `/etc/nginx/conf.d/default.conf`:
-```bash
-mcedit /etc/nginx/conf.d/default.conf
-```
-
-Для включения роутинга находим в файле все строки содержащие `urlrewrite.php`. Добавляем `#` в начало таких строк. Ниже в строках с`routing_index.php` убираем `#`:
-```bash
-#fastcgi_param SCRIPT_FILENAME $document_root/bitrix/urlrewrite.php;
-fastcgi_param SCRIPT_FILENAME $document_root/bitrix/routing_index.php;
-```
-
-Для отключения роутинга находим в файле все строки содержащие `routing_index.php`. Добавляем `#` в начало таких строк. Выше в строках с`urlrewrite.php` убираем `#`:
 ```bash
 fastcgi_param SCRIPT_FILENAME $document_root/bitrix/urlrewrite.php;
 #fastcgi_param SCRIPT_FILENAME $document_root/bitrix/routing_index.php;
 ```
 
-Сохраняем файл. Выходим из консоли контейнера. Проверяем настройки `nginx`:
+Проверяем конфигурацию и перезапускаем веб-сервер:
+
 ```bash
 docker compose exec --user=bitrix nginx sh -c "nginx -t"
-```
-
-Если никаких ошибок нет, перезапускаем контейнер `nginx`:
-```bash
 docker compose restart nginx
 ```
 
+Документация: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&CHAPTER_ID=013764&LESSON_PATH=3913.3516.5062.13764
+
 <a id="nginx"></a>
-# Nginx
+## Nginx
 
-<a id="nginxmodules"></a>
-## Модули для Nginx
+Конфигурация подключается с хоста из каталога `confs/nginx/`:
 
-Подключение модулей Nginx производится в файле `/etc/nginx/inc/modules.conf` контейнера, содержимое которого можно найти в файле `/confs/nginx/inc/modules.conf` репозитория.
+```bash
+confs/nginx/nginx.conf          - основной файл
+confs/nginx/conf.d/default.conf - серверы сайта (HTTP :80 и служебный :8893)
+confs/nginx/inc/                - подключаемые блоки: static, block, bx_temp, proxy, dav, intranet, clouds, errors, modules, composite
+confs/nginx/maps/               - карты (resize_cache)
+confs/nginx/errors/             - страницы ошибок 403/404/500/502/503/504
+confs/nginx/blank/              - заглушка для служебного сервера
+```
 
-По умолчанию в контейнере `nginx`, запущенного из образа `bitrix24/nginx`, подключаются следующие модули:
+После правки любого файла проверяем конфигурацию и перезапускаем контейнер:
+
+```bash
+docker compose exec --user=bitrix nginx sh -c "nginx -t"
+docker compose restart nginx
+```
+
+### Модули для Nginx
+
+Модули подключаются в файле `confs/nginx/inc/modules.conf`. По умолчанию в образе `bitrix24/nginx` подключены:
 - `brotli`
 - `headers-more`
 - `zip`
 
-<a id="nginxmoduleonoroff"></a>
-## Подключение или отключение модуля для Nginx
+Доступны также `acme`, `geoip`, `geoip2`, `image-filter`, `lua`, `ndk`, `njs`, `perl`, `xslt`.
 
-Заходим в sh-консоль контейнера `nginx` из-под пользователя `root`:
-```bash
-docker compose exec --user=root nginx sh
-```
+Подключение модуля - строка вида:
 
-Выполняем:
-```bash
-apk add mc
-exit
-```
-
-Заходим в sh-консоль контейнера `nginx` из-под пользователя `bitrix`:
-```bash
-docker compose exec --user=bitrix nginx sh
-```
-
-Редактируем файл `/etc/nginx/inc/modules.conf`:
-```bash
-mcedit /etc/nginx/inc/modules.conf
-```
-
-Для подключения модуля приводим строку к виду `load_module "/usr/lib/nginx/modules/***.so";`. Пример для модуля `perl`:
 ```bash
 load_module "/usr/lib/nginx/modules/ngx_http_perl_module.so";
 ```
 
-Для отключения модуля приводим строку к виду `#load_module "/usr/lib/nginx/modules/***.so";`. Пример для модуля `perl`:
+Отключение - та же строка с `#` в начале. После правки - `nginx -t` и перезапуск контейнера.
+
+<a id="sitecheckerandperfmon"></a>
+## Проверка системы и тест производительности
+
+`Проверка системы` (`/bitrix/admin/site_checker.php?lang=ru`) - всесторонняя проверка соответствия параметров системы техническим требованиям продукта.
+
+Документация:
+- https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=35&LESSON_ID=14020&LESSON_PATH=3906.4493.4506.2024.14020
+- https://dev.1c-bitrix.ru/user_help/settings/utilities/site_checker.php
+
+`Панель производительности` (`/bitrix/admin/perfmon_panel.php?lang=ru`) - тест конфигурации, показывает "узкие" места системы.
+
+Документация: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=35&CHAPTER_ID=03376&LESSON_PATH=3906.6663.4904.3376
+
+<a id="softwareversions"></a>
+## Версии ПО
+
+Текущие версии по умолчанию:
+
 ```bash
-#load_module "/usr/lib/nginx/modules/ngx_http_perl_module.so";
+Memcached 1.6.x
+Redis 8.2.x
+Percona Server 8.0.x
+PHP 8.2.x
+Nginx 1.30.x
+Sphinx 2.2.11
 ```
 
-Выходим из консоли контейнера и проверяем настройки `nginx`:
-```bash
-docker compose exec --user=bitrix nginx sh -c "nginx -t"
-```
+Альтернативные версии переключаются комментированием строк в `docker-compose.yml` **до первого запуска** проекта.
 
-Если никаких ошибок нет, перезапускаем контейнер `nginx`:
-```bash
-docker compose restart nginx
-```
-
-<a id="memcacheandredis"></a>
-# Memcache и Redis
-
-<a id="memcache"></a>
-## Memcache
-
-Контейнер `memcached` может быть использован для хранения кеша и для хранения данных сессий.
-
-<a id="redis"></a>
-## Redis
-
-Контейнер `redis` используется в связке с Push-сервером.
-
-Также может быть использован для хранения кеша и для хранения данных сессий.
-
-По умолчанию сервис `redis` работает в режиме "без пароля". Возможно и обратное, когда сервис `redis` работает в режиме "обязательно с паролем".
-
-Настройка пароля для `Redis` описана выше в главе [Пароль для Redis](#redispassword).
-
-<a id="cachestorage"></a>
-## Кеширование
-
-Ядро поддерживает несколько вариантов для хранения кеша: `файлы`, `redis`, `memcache` и т.д.
-
-В административной части продукта на странице `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`) отредактируем файл `/bitrix/.settings.php`, добавляем блок настроек, который определит вариант хранения:
-
-- `memcache`:
-```php
-        // cache on memcache
-        'cache' => [
-                'value' => [
-                        'type' => [
-                                'class_name' => '\\Bitrix\\Main\\Data\\CacheEngineMemcache',
-                                'extension' => 'memcache'
-                        ],
-                        'memcache' => [
-                                'host' => 'memcached',
-                                'port' => '11211',
-                        ]
-                ],
-                'sid' => $_SERVER["DOCUMENT_ROOT"]."#01234"
-        ],
-```
-
-- `redis` без пароля:
-```php
-        // cache on redis
-        'cache' => [
-                'value' => [
-                        'type' => [
-                                'class_name' => '\\Bitrix\\Main\\Data\\CacheEngineRedis',
-                                'extension' => 'redis'
-                        ],
-                        'redis' => [
-                                'host' => 'redis',
-                                'port' => '6379',
-                        ]
-                ],
-                'sid' => $_SERVER["DOCUMENT_ROOT"]."#01234"
-        ],
-```
-
-- `redis` с паролем:
-```php
-        // cache on redis with password
-        'cache' => [
-                'value' => [
-                        'type' => [
-                                'class_name' => '\\Bitrix\\Main\\Data\\CacheEngineRedis',
-                                'extension' => 'redis'
-                        ],
-                        'redis' => [
-                                'host' => 'redis',
-                                'port' => '6379',
-                                'password' => 'CHANGE_REDIS_PASSWORD_HERE',
-                        ]
-                ],
-                'sid' => $_SERVER["DOCUMENT_ROOT"]."#01234"
-        ],
-```
-
-Меняем шаблон `CHANGE_REDIS_PASSWORD_HERE` на пароль сервиса `redis`, который был создан вами в главе [Пароль для Redis](#redispassword). Его значение хранится в файле `.env_redis`.
-
-Документация: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&CHAPTER_ID=02795&LESSON_PATH=3913.3516.5062.2795#cache
-
-<a id="sessionstorage"></a>
-## Хранение сессий
-
-Ядро поддерживает четыре варианта для хранения данных сессии: `файлы`, `database`, `redis`, `memcache`.
-
-В административной части продукта на странице `Управление структурой` (`/bitrix/admin/fileman_admin.php?lang=ru&path=%2F`) отредактируем файл `/bitrix/.settings.php`, добавляем блок настроек, который определит вариант хранения:
-
-- `memcache`, разделенная сессия:
-```php
-        // sessions on memcache (separated)
-        'session' => [
-                'value' => [
-                        'lifetime' => 14400,
-                        'mode' => 'separated',
-                        'handlers' => [
-                                'kernel' => 'encrypted_cookies',
-                                'general' => [
-                                        'type' => 'memcache',
-                                        'port' => '11211',
-                                        'host' => 'memcached',
-                                ],
-                        ],
-                ],
-        ],
-```
-
-- `redis` без пароля:
-```php
-        // sessions on redis
-        'session' => [
-                'value' => [
-                        'mode' => 'default',
-                        'handlers' => [
-                                'general' => [
-                                        'type' => 'redis',
-                                        'port' => '6379',
-                                        'host' => 'redis',
-                                ],
-                        ],
-                ],
-        ],
-```
-
-- `redis` с паролем:
-```php
-        // sessions on redis with password
-        'session' => [
-                'value' => [
-                        'mode' => 'default',
-                        'handlers' => [
-                                'general' => [
-                                        'type' => 'redis',
-                                        'port' => '6379',
-                                        'host' => 'redis',
-                                        'password' => 'CHANGE_REDIS_PASSWORD_HERE',
-                                ],
-                        ],
-                ],
-        ],
-```
-
-Меняем шаблон `CHANGE_REDIS_PASSWORD_HERE` на пароль сервиса `redis`, который был создан вами в главе [Пароль для Redis](#redispassword). Его значение хранится в файле `.env_redis`.
-
-- `database`:
-```php
-        // sessions on database
-        'session' => [
-                'value' => [
-                        'mode' => 'default',
-                        'handlers' => [
-                                'general' => [
-                                        'type' => 'database',
-                                ],
-                        ],
-                ],
-        ],
-```
-
-Сохраняем файл.
-
-Все возможные варианты доступны в документации: https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=43&LESSON_ID=14026
-
-<a id="clustercachestorage"></a>
-## Кеширование с помощью модуля Веб-кластер
-
-Альтернативный способ использования кеширования для продуктов `1С-Битрикс: Управление сайтом` и `1С-Битрикс24` при условии, что в редакции есть модуль `Веб-кластер` (`cluster`).
-
-<a id="clustercachememcache"></a>
-### Memcache
-
-В административной части продукта на странице настроек модуля `Веб-кластер` (`/bitrix/admin/settings.php?lang=ru&mid=cluster`) выбираем `Использовать для хранения кеша` - `Memcache`.
-
-Сохраняем настройки.
-
-В административной части продукта на странице `Подключения к memcached` (`/bitrix/admin/cluster_memcache_list.php?lang=ru&group_id=1`) добавляем новое подключение и указываем:
-- `Сервер` - `memcached`
-- `Порт` - `11211`
-- `Процент распределения нагрузки (0..100)` - `100`
-
-Сохраняем подключение. В списке подключений для созданного подключения нажимаем `Начать использовать`.
-
-Процесс отключения и удаления обратный добавлению.
-
-<a id="clustercacheredis"></a>
 ### Redis
 
-В административной части продукта на странице настроек модуля `Веб-кластер` (`/bitrix/admin/settings.php?lang=ru&mid=cluster`) выбираем `Использовать для хранения кеша` - `Redis`.
+Доступны версии `7.2.x`, `7.4.x`, `8.0.x`, `8.4.x`, `8.6.x`, `8.8.x`. Пример перехода на `8.4.x`:
 
-Сохраняем настройки.
-
-В административной части продукта на странице `Подключения к redis` (`/bitrix/admin/cluster_redis_list.php?lang=ru&group_id=1`) добавляем новое подключение и указываем:
-- `Сервер` - `redis`
-- `Порт` - `6379`
-
-Сохраняем подключение. В списке подключений для созданного подключения нажимаем `Начать использовать`.
-
-Процесс отключения и удаления обратный добавлению.
-
-<a id="httpsssltlswss"></a>
-# HTTPS/SSL/TLS/WSS
-
-<a id="selfsignedcerts"></a>
-## Самоподписанный сертификат
-
-Сгенерировать и использовать SSL-сертификат в режиме самоподписи возможно с помощью отдельного контейнера `ssl` на базе образа `bitrix24/ssl`.
-
-Данные, отображаемые в сертификатах корневого и промежуточного центров сертификации, хранятся в файле `.env_ssl`. Строки настроек начинаются с `CA_`.
-
-При необходимости отредактируйте файл `.env_ssl`, укажите ваши данные по примеру:
-- `Название страны`: введите двухбуквенный код вашей страны (пример, `RU`)
-- `Название штата или провинции`: введите название штата, в котором официально зарегистрирована ваша организация (пример, `Kaliningrad Region`)
-- `Название населенного пункта`: введите название населенного пункта или города, в котором находится ваша компания (пример, `Kaliningrad`)
-- `Название организации`: укажите официальное название вашей организации (пример, `Dev Corporation Ltd`)
-- `Имя организационного подразделения`: введите название подразделения в вашей организации, отвечающего за управление сертификатами (пример, `Dev Corporation Ltd Unit`)
-- `Адрес электронной почты`: пример, `info@devcorporation.ltd`
-
-Данные, отображаемые в сертификате для домена, также хранятся в файле `.env_ssl`. Строки настроек начинаются с `CERT_`.
-
-При необходимости отредактируйте файл `.env_ssl`, укажите ваши данные по примеру:
-- `Название страны`: введите двухбуквенный код вашей страны (пример, `RU`)
-- `Название штата или провинции`: введите название штата, в котором официально зарегистрирована ваша организация (пример, `Kaliningrad Region`)
-- `Название населенного пункта`: введите название населенного пункта или города, в котором находится ваша компания (пример, `Kaliningrad`)
-- `Название организации`: укажите официальное название вашей организации (пример, `Dev Corporation Ltd`)
-- `Имя организационного подразделения`: введите название подразделения в вашей организации, отвечающего за управление сертификатами (пример, `Dev Corporation Ltd Unit`)
-- `Адрес электронной почты`: пример, `info@devcorporation.ltd`
-
-> [!IMPORTANT]
-> Если данные, отображаемые в сертификатах корневого и промежуточного центров сертификации, были изменены в файле `.env_ssl`, необходимо пересоздать контейнер `ssl`.
->
-> Для этого выполните последовательно команды остановки, удаления, пересоздания и запуска контейнера `ssl`:
-> ```bash
-> docker compose stop ssl
-> docker compose rm -f ssl
-> docker compose up -d
-> ```
-
-<a id="selfsigneddeploys"></a>
-### Выпуск сертификатов
-
-Одной командой разово генерируем сертификаты корневого и промежуточного центров сертификации:
-```bash
-docker compose exec --user=bitrix ssl bash -c "~/cas.sh"
+```yaml
+#image: redis:7.2.14-alpine
+#image: redis:7.4.9-alpine
+#image: redis:8.0.6-alpine
+#image: redis:8.2.7-alpine
+image: redis:8.4.4-alpine
+#image: redis:8.6.4-alpine
+#image: redis:8.8.0-alpine
 ```
 
-Второй - сертификат и приватный ключ для домена `dev.bx`:
-```bash
-docker compose exec --user=bitrix ssl bash -c "~/srv.sh dev.bx"
+### MySQL (Percona Server)
+
+Доступна альтернативная версия `8.4.x`:
+
+```yaml
+#image: quay.io/bitrix24/percona-server:8.0.46-v1-rhel
+image: quay.io/bitrix24/percona-server:8.4.10-v1-rhel
 ```
-
-Итого в папке `/ssl/` внутри контейнера `ssl` будет набор файлов:
-- `rootCA.cert.pem` - сертификат корневого центра сертификации
-- `intermediateCA.cert.pem` - сертификат промежуточного центра сертификации, подписанный корневым сертификатом
-- `ca-chain.cert.pem` - цепочка сертификатов обоих центров сертификации
-- `dev.bx.cert.pem` - сертификат домена, подписанный промежуточным центром сертификации
-- `dev.bx.key.pem` - приватный ключ сертификата
-- `dev.bx.chain.cert.pem` - цепочка сертификатов, содержит сертификат домена и сертификат промежуточного центра сертификации
-- `dev.bx.fullchain.cert.pem` - полная цепочка всех сертификатов, содержит сертификат домена, сертификат промежуточного центра сертификации, сертификат корневого центра сертификации
-- `dhparam.pem` - секретный криптографический ключ, созданный по алгоритму Диффи-Хеллмана для обмена сессионными ключами с клиентом
-
-Файл `dhparam.pem` не создается, а поставляется для примера. Если нужно его сделать уникальным, выполните команду:
-```bash
-docker compose exec --user=bitrix ssl bash -c "openssl dhparam -out /ssl/dhparam.pem 4096"
-```
-
-> [!IMPORTANT]
-> Создание файла dhparam.pem может занять значительное время, зависящее от производительности вашего оборудования.
-
-<a id="selfsignedtrustforphpandnginx"></a>
-### Доверие к сертификатам центров сертификации для PHP и Nginx
-
-Сертификат корневого центра сертификации (`rootCA.cert.pem`) и сертификат промежуточного центра сертификации (`intermediateCA.cert.pem`) нужно добавить в траст контейнеров `nginx` и `php`.
-
-Заходим в sh-консоль контейнера `php` из-под пользователя `root`:
-```bash
-docker compose exec --user=root php sh
-```
-
-Выполняем:
-```bash
-mkdir -p /usr/local/share/ca-certificates/
-ln -s /ssl/rootCA.cert.pem /usr/local/share/ca-certificates/rootCA.cert.pem
-ln -s /ssl/intermediateCA.cert.pem /usr/local/share/ca-certificates/intermediateCA.cert.pem
-update-ca-certificates
-```
-
-Если локальный домен не определяется в вашей сети, нужно в файле `/etc/hosts` контейнера `php` добавить:
-```bash
-apk add mc
-mcedit /etc/hosts
-10.0.1.119 dev.bx
-exit
-```
-
-Заходим в sh-консоль контейнера `nginx` из-под пользователя `root`:
-```bash
-docker compose exec --user=root nginx sh
-```
-
-Выполняем:
-```bash
-mkdir -p /usr/local/share/ca-certificates/
-ln -s /ssl/rootCA.cert.pem /usr/local/share/ca-certificates/rootCA.cert.pem
-ln -s /ssl/intermediateCA.cert.pem /usr/local/share/ca-certificates/intermediateCA.cert.pem
-update-ca-certificates
-```
-
-<a id="installselfsignedcerts"></a>
-### Установка сертификатов
-
-Также нам нужно в SSL конфигурацию `nginx` прописать новые сертификаты. Редактируем файл `/etc/nginx/ssl/ssl.conf`, меняем настройки опций `ssl_*`:
-```bash
-apk add mc
-mcedit /etc/nginx/ssl/ssl.conf
-```
-
-Меняем опции на:
-```bash
-ssl_certificate /ssl/dev.bx.fullchain.cert.pem;
-ssl_certificate_key /ssl/dev.bx.key.pem;
-ssl_trusted_certificate /ssl/ca-chain.cert.pem;
-ssl_dhparam /ssl/dhparam.pem;
-```
-
-Также скопируем файлы сертификата корневого центра сертификации (`rootCA.cert.pem`) и сертификата промежуточного центра сертификации (`intermediateCA.cert.pem`) в корень сайта:
-```bash
-cp /ssl/rootCA.cert.pem /opt/www/
-cp /ssl/intermediateCA.cert.pem /opt/www/
-chown bitrix:bitrix /opt/www/rootCA.cert.pem
-chown bitrix:bitrix /opt/www/intermediateCA.cert.pem
-exit
-```
-
-Проверяем настройки `nginx`:
-```bash
-docker compose exec --user=bitrix nginx sh -c "nginx -t"
-```
-
-Если никаких ошибок нет, перезапускаем контейнер `nginx`:
-```bash
-docker compose restart nginx
-```
-
-<a id="importselfsignedcertstoosorbrowser"></a>
-### Импорт сертификатов в ОС или браузер
-
-На хосте, где будем использовать браузер, скачиваем файлы центров сертификации по ссылкам:
-```bash
-http://dev.bx:8588/rootCA.cert.pem
-http://dev.bx:8588/intermediateCA.cert.pem
-```
-
-Добавляем их в траст ОС, на которой работает браузер.
-
-Все ОС: `Windows`, `Linux`, `MacOS`
-
-Общая часть для всех - браузер `Mozilla Firefox`. Имеет своё хранилище сертификатов центров сертификации. Работает одинаково вне зависимости от ОС.
-
-В браузере переходим `Настройки` -> `Приватность и защита` -> `Защита` -> `Сертификаты`.
-
-Нажимаем кнопку `Просмотр сертификатов`, в окне переходим на вкладку `Центры сертификации`.
-
-Нажимаем кнопку `Импортировать`:
-- первый раз выбираем файл сертификата корневого центра сертификации (`rootCA.cert.pem`)
-- второй раз выбираем файл сертификата промежуточного центра сертификации (`intermediateCA.cert.pem`)
-
-ОС: `Windows`
-
-Браузеры `Google Chrome` и `Microsoft Edge` (и другие на их базе) используют системное хранилище ОС для сертификатов центров сертификации.
-
-Скачанные файлы переименовываем, меняем расширение с `pem` на `crt`:
-- `rootCA.cert.pem` -> `rootCA.cert.crt`
-- `intermediateCA.cert.pem` -> `intermediateCA.cert.crt`
-
-Дважды кликаем на файле `rootCA.cert.crt`, откроется просмотр сертификата.
-
-Нажимаем кнопку `Установить сертификат`.
-
-Проходим мастер импорта. Выбираем `Поместить все сертификаты в следующие хранилища`, в окне выбираем `Доверенные корневые центры сертификации`.
-
-ОС: `Linux`
-
-Выбор пути зависит от используемой вами ОС Linux.
-
-Для ОС `Debian`, `Ubuntu` и ОС на их базе
-
-Устанавливаем пакет `ca-certificates` и создаем объединенный траст файл со всеми сертификатами:
-```bash
-apt install -y ca-certificates
-update-ca-certificates
-```
-
-Скачанные файлы переименовываем, меняем расширение с `.pem` на `.crt`:
-- `rootCA.cert.pem` -> `rootCA.cert.crt`
-- `intermediateCA.cert.pem` -> `intermediateCA.cert.crt`
-
-Например, с помощью команды `cp` выполняем:
-```bash
-cp rootCA.cert.pem rootCA.cert.crt
-cp intermediateCA.cert.pem intermediateCA.cert.crt
-```
-
-Для файлов сертификата корневого центра сертификации (`rootCA.cert.crt`) и сертификата промежуточного центра сертификации (`intermediateCA.cert.crt`) создаем символические ссылки в каталоге `/usr/local/share/ca-certificates/`:
-```bash
-ln -s rootCA.cert.crt /usr/local/share/ca-certificates/rootCA.cert.crt
-ln -s intermediateCA.cert.crt /usr/local/share/ca-certificates/intermediateCA.cert.crt
-```
-
-Обновляем объединенный траст файл со всеми сертификатами командой:
-```bash
-update-ca-certificates
-```
-
-Для ОС `RHEL`, `CentOS Stream`, `Rocky Linux`, `AlmaLinux`, `Oracle Linux`, `EuroLinux`, `Fedora` и ОС на их базе
-
-Устанавливаем пакет `ca-certificates`:
-```bash
-dnf install -y ca-certificates
-```
-
-Для операционных систем 9-ой серии и выше (пример, RHEL 9, CentOS Stream 9 и т.д.) выполняем команду:
-```bash
-update-ca-trust
-```
-
-Для операционных систем ниже 9-ой серии (пример, Rocky Linux 8.x и т.д.) выполняем команды:
-```bash
-update-ca-trust force-enable
-update-ca-trust enable
-```
-
-Для файлов сертификата корневого центра сертификации (`rootCA.cert.pem`) и сертификата промежуточного центра сертификации (`intermediateCA.cert.pem`) создаем символические ссылки в каталоге `/etc/pki/ca-trust/source/anchors/`:
-```bash
-ln -s rootCA.cert.pem /etc/pki/ca-trust/source/anchors/rootCA.cert.pem
-ln -s intermediateCA.cert.pem /etc/pki/ca-trust/source/anchors/intermediateCA.cert.pem
-```
-
-Обновляем траст корневых сертификатов (CA Trust) машины командой:
-```bash
-update-ca-trust extract
-```
-
-Для ОС `Arch`, `Bluestar`, `Manjaro`, `EndeavourOS`, `Garuda`, `Mabox`, `RebornOS`, `Archcraft`, `ArchLabs`, `CachyOS` и ОС на их базе
-
-Устанавливаем пакет `ca-certificates` и обновляем траст корневых сертификатов (CA Trust) машины:
-```bash
-pacman -Syu ca-certificates
-update-ca-trust
-```
-
-Скачанные файлы переименовываем, меняем расширение с `.pem` на `.crt`:
-- `rootCA.cert.pem` -> `rootCA.cert.crt`
-- `intermediateCA.cert.pem` -> `intermediateCA.cert.crt`
-
-Например, с помощью команды `cp` выполняем:
-```bash
-cp rootCA.cert.pem rootCA.cert.crt
-cp intermediateCA.cert.pem intermediateCA.cert.crt
-```
-
-Для файлов сертификата корневого центра сертификации (`rootCA.cert.crt`) и сертификата промежуточного центра сертификации (`intermediateCA.cert.crt`) создаем символические ссылки в каталоге `/etc/ca-certificates/trust-source/anchors/`:
-```bash
-ln -s rootCA.cert.crt /etc/ca-certificates/trust-source/anchors/rootCA.cert.crt
-ln -s intermediateCA.cert.crt /etc/ca-certificates/trust-source/anchors/intermediateCA.cert.crt
-```
-
-Обновляем траст корневых сертификатов (CA Trust) машины командой:
-```bash
-update-ca-trust extract
-```
-
-ОС: `MacOS`
-
-Открываем приложение `Связка ключей`.
-
-Чтобы быстро открыть `Связку ключей`, найдите ее через `Spotlight`, затем нажмите клавишу `Ввод`.
-
-В категории `Системные связки ключей` выбираем `Система`, кликаем для открытия и выбора.
-
-В меню `Файл` выбираем `Импортировать объекты`, выбираем файл сертификата корневого центра сертификации (`rootCA.cert.pem`).
-
-На вкладке `Сертификаты` находим добавленный сертификат, выделяем его, в меню выбираем `Свойства`.
-
-В окне просмотра сертификата разворачиваем группу настроек `Доверие`.
-
-В настройке `Параметры использования сертификата` выбираем `Всегда доверять`.
-
-Закрываем окно, подтверждаем доверие сертификата.
-
-Аналогичным способом проходим путь для файла сертификата промежуточного центра сертификации (`intermediateCA.cert.pem`).
-
-Итог: после настройки выше переходим на сайт по URL с доменом `dev.bx`, используя `https` и порт `8589` в URL:
-```bash
-https://dev.bx:8589/
-```
-
-Устанавливаем дистрибутив, восстанавливаем бекап сайта - выбора за вами.
-
-Выполняем подстройку сайта как указано выше в этом README-файле.
-
-Страница `Проверка системы` (`/bitrix/admin/site_checker.php?lang=ru`) открывается по `https` и сама проверка проходит, используя `ssl` коннект вида:
-```bash
-Connection to ssl://dev.bx:8589	Success
-```
-
-Push-сервер использует безопасные веб-сокеты, соединение устанавливается по протоколу `wss`. Пуши отправляются корректно, интерактивность функционирует.
-
-<a id="removeselfsignedcertsfromosorbrowser"></a>
-### Удаление сертификатов из ОС или браузера
-
-> [!IMPORTANT]
-> При удалении сайта не забудьте удалить сертификат корневого центра сертификации (`rootCA.cert.pem`) и сертификат промежуточного центра сертификации (`intermediateCA.cert.pem`) из ОС и браузера.
-
-Для браузера `Mozilla Firefox` процесс удаления обратный добавлению.
-
-Для удаления сертификатов центров сертификации в ОС `Windows`:
-- запустите оснастку сертификатов, выполнив команду `certmgr.msc`
-- в ней перейдите `Сертификаты` - `Доверенные корневые центры сертификации` - `Сертификаты`
-- найдите сертификаты центров сертификации
-- сначала удалите сертификат промежуточного центра сертификации, затем сертификат корневого центра сертификации, выбрав их в списке по одному и в меню выбрав пункт `удалить`
-- подтвердите удаление
-
-Для удаления сертификатов центров сертификации в ОС `Linux`:
-
-Выбор пути зависит от используемой вами ОС Linux.
-
-Для ОС `Debian`, `Ubuntu` и ОС на их базе
-
-Удаляем символические ссылки для файлов сертификата корневого центра сертификации (`rootCA.cert.crt`) и сертификата промежуточного центра сертификации (`intermediateCA.cert.crt`):
-```bash
-rm -f /usr/local/share/ca-certificates/rootCA.cert.crt
-rm -f /usr/local/share/ca-certificates/intermediateCA.cert.crt
-```
-
-Обновляем объединенный траст файл со всеми сертификатами командой:
-```bash
-update-ca-certificates
-```
-
-Для ОС `RHEL`, `CentOS Stream`, `Rocky Linux`, `AlmaLinux`, `Oracle Linux`, `EuroLinux`, `Fedora` и ОС на их базе
-
-Удаляем символические ссылки для файлов сертификата корневого центра сертификации (`rootCA.cert.pem`) и сертификата промежуточного центра сертификации (`intermediateCA.cert.pem`):
-```bash
-rm -f /etc/pki/ca-trust/source/anchors/rootCA.cert.pem
-rm -f /etc/pki/ca-trust/source/anchors/intermediateCA.cert.pem
-```
-
-Обновляем траст корневых сертификатов (CA Trust) машины командой:
-```bash
-update-ca-trust extract
-```
-
-Для ОС `Arch`, `Bluestar`, `Manjaro`, `EndeavourOS`, `Garuda`, `Mabox`, `RebornOS`, `Archcraft`, `ArchLabs`, `CachyOS` и ОС на их базе
-
-Удаляем символические ссылки для файлов сертификата корневого центра сертификации (`rootCA.cert.crt`) и сертификата промежуточного центра сертификации (`intermediateCA.cert.crt`):
-```bash
-rm -f /etc/ca-certificates/trust-source/anchors/rootCA.cert.crt
-rm -f /etc/ca-certificates/trust-source/anchors/intermediateCA.cert.crt
-```
-
-Обновляем траст корневых сертификатов (CA Trust) машины командой:
-```bash
-update-ca-trust extract
-```
-Для удаления сертификатов центров сертификации в ОС `MacOS`:
-
-Откройте приложение `Связка ключей`.
-
-Чтобы быстро открыть `Связку ключей`, найдите ее через `Spotlight`, затем нажмите клавишу `Ввод`.
-
-В категории `Системные связки ключей` выбираем `Система`, кликаем для открытия и выбора.
-
-Переходим на вкладку `Сертификаты`.
-
-Находим файл сертификата промежуточного центра сертификации (`intermediateCA.cert.pem`).
-
-Выбираем его и в меню кликаем `Удалить`.
-
-Подтверждаем удаление сертификата промежуточного центра сертификации из связки ключей `Система`.
-
-Аналогичным способом проходим путь для удаления из связки ключей `Система` сертификата корневого центра сертификации (`rootCA.cert.pem`).
-
-<a id="presentcerts"></a>
-## Бесплатный Lets Encrypt сертификат
-
-<a id="lego"></a>
-### Lego
-
-Выпустить и использовать бесплатный SSL-сертификат от LetsEncrypt возможно с помощью отдельного контейнера `lego` на базе образа `bitrix24/lego`.
-
-Внутри образа находится `LetsEncrypt` клиент и `ACME` библиотека, написанная на `Go`. По сокращениям первых букв слов получаем название проекта `LeGo` ([GitHub](https://github.com/go-acme/lego), [DockerHub](https://hub.docker.com/r/goacme/lego)).
-
-Основные возможности проекта `Lego`:
-- ACME v2 с поддержкой множества RFC и draft-ов
-- поддержка 150 DNS-провайдеров
-- выпуск, перевыпуск, отзыв SSL-сертификатов
-- HTTPS, DNS, TLS челленджи
-- выпуск сертификатов:
-  - на один домен (singledomain)
-  - на множество поддоменов домена (не больше 100 в одном сертификате) (multidomain)
-  - на все множество поддоменных имен домена (*) (wildcard)
-- и многое другое
-
-<a id="domaintransfer"></a>
-### Перенаправление или перенос домена
-
-Перед тем как выполнять запросы на получение или обновление SSL-сертификатов с помощью LetsEncrypt нам необходимо перенаправить (или перенести) домен от поставщика услуг на DNS-хостинг провайдера.
-
-Рассмотрим примеры в общих чертах, в деталях информацию необходимо найти в документации поставщиков услуг и DNS-провайдеров.
-
-Пример 1: домен `example.dev` приобретен в `Reg.ru`, переносим его в `YandexCloud`.
-
-В консоли `YandexCloud` добавляем домен, система потребует от нас прописать DNS-сервера у поставщика услуг. Возвращаемся в `Reg.ru`, прописываем требуемые DNS-записи `Yandex`, сохраняем.
-
-Ожидаем завершения процесса переноса. Проверить DNS-записи можно с помощью сервиса https://dnschecker.org/.
-
-Пример 2: домен `proj.site` приобретен в `Reg.ru`, переносим его в `CloudFlare`.
-
-В консоли `CloudFlare` добавляем домен, система потребует от нас прописать DNS-сервера у поставщика услуг. Возвращаемся в `Reg.ru`, прописываем требуемые DNS-записи `CloudFlare`, сохраняем.
-
-Ожидаем завершения процесса переноса. Проверить DNS-записи можно с помощью сервиса https://dnschecker.org/.
-
-<a id="letsencryptchallenges"></a>
-### Челленджи
-
-Челлендж - дословно это `вызов`, который `бросает` ваш клиент сервису `LetsEncrypt`. Эти задания содержат домен(ы) и способ его(их) проверки (верификации). При успешном выполнении клиент получает сертификат.
-
-`Lego` поддерживает три типа челленджей: `HTTP`, `DNS`, `TLS`.
-
-`TLS` челлендж рассматривать не будем в виду сложности реализации и использования.
-
-Рассмотрим `HTTP` и `DNS` челленджи как самые часто используемые.
 
 > [!CAUTION]
-> Внимание! `HTTP` челлендж возможно пройти `ТОЛЬКО` на порту `80`.
->
-> Внимание! С помощью `HTTP` челленджа невозможно получить `wildcard` сертификаты.
+> Внимание! Менять версию базы у уже наполненного тома `dev_mysql_lib_data` нельзя без предварительного дампа: формат файлов данных между мажорными версиями несовместим. Правильный путь - снять дамп (пункт 2.3), удалить том, поднять новую версию и импортировать дамп заново.
 
-Подробней в документации LetsEncrypt: https://letsencrypt.org/docs/challenge-types/
+### PHP и Cron
 
-<a id="letsencrypthttpchallenge"></a>
-#### HTTP челлендж (http-01)
+Доступны версии `8.3.x`, `8.4.x`, `8.5.x`. Правки нужны **в обоих** сервисах - `php` и `cron`. Пример перехода на `8.3.x`:
 
-Чтобы выполнить это задание, завершить `HTTP` челлендж и в итоге получить бесплатный SSL-сертификат, вам необходимо:
-
-- в управлении DNS-записями вашего домена добавить:
-  - `А` запись на один домен (singledomain), пример: `example.dev` или `chat.example.dev` и т.д.
-  - `A` записи для каждого из множества поддоменов домена (multidomain), пример: `example.dev`, `chat.example.dev`, `forum.example.dev` и т.д.
-
-- с помощью сервиса https://dnschecker.org/ проверить распределение и доступность добавленных DNS-записей
-
-- запустить сайт, проверить что он отвечает по `http` и заданному домену из сети интернет, используя порт `80` для `HTTP` челленджа
-
-- запустить `HTTP` челлендж, указать домен, тип сертификата и другие параметры
-
-<a id="letsencryptdnschallenge"></a>
-#### DNS челлендж (dns-01)
-
-Чтобы выполнить это задание, завершить `DNS` челлендж и в итоге получить бесплатный SSL-сертификат, вам необходимо:
-
-- в управлении DNS-записями вашего домена добавить:
-  - `А` запись на один домен (singledomain), пример: `example.dev` или `chat.example.dev` и т.д.
-  - `A` записи для каждого из множества поддоменов домена (multidomain), пример: `example.dev`, `chat.example.dev`, `forum.example.dev` и т.д.
-  - `А` запись для множества имен домена (wildcard), пример: `example.dev` или `*.example.dev`
-
-- с помощью сервиса https://dnschecker.org/ проверить распределение и доступность добавленных DNS-записей
-
-- запустить `DNS` челлендж, указать домен, тип сертификата и другие параметры
-
-<a id="legocommands"></a>
-### Команды lego
-
-Заходим в sh-консоль контейнера `lego` из-под пользователя `bitrix`:
-```bash
-docker compose exec --user=bitrix lego sh
+```yaml
+#image: quay.io/bitrix24/php:8.2.32-fpm-v1-alpine
+image: quay.io/bitrix24/php:8.3.32-fpm-v1-alpine
+#image: quay.io/bitrix24/php:8.4.23-fpm-v1-alpine
+#image: quay.io/bitrix24/php:8.5.8-fpm-v1-alpine
 ```
 
-Основная точка входа - это команда `/lego`, после которой следует набор параметров. Узнать их можно, добавив запрос справки `help` одним из способов:
-```bash
-/lego help
-/lego -h
-/lego --help
+и в секции `volumes` того же сервиса:
+
+```yaml
+#- ./confs/php82/etc/:/usr/local/etc/
+- ./confs/php83/etc/:/usr/local/etc/
+#- ./confs/php84/etc/:/usr/local/etc/
+#- ./confs/php85/etc/:/usr/local/etc/
 ```
 
-Также можно узнать справку по выбранной команде, выполнив:
+После правки:
 
 ```bash
-/lego run --help
-/lego renew --help
-/lego revoke --help
-/lego list --help
-/lego dnshelp --help
+docker compose up -d
 ```
 
-где:
-- `run` - создание аккаунта, выпуск и установка ssl сертификата
-- `renew` - перевыпуск (обновление) ssl сертификата
-- `revoke` - отзыв ssl сертификата
-- `list` - отображение сертификатов и аккаунтов
-- `dnshelp` - справка по параметрам dns сервиса (для DNS челленджа)
-
-Все возможные варианты параметров команд указаны в документации: https://go-acme.github.io/lego/usage/cli/options/index.html
-
-<a id="legocommandhttpchallenge"></a>
-#### Команда для HTTP челленджа (http-01)
-
-Общая команда `lego` для прохождения `HTTP` челленджа имеет вид:
-
-```bash
-/lego \
-[SERVER]
-[TOS]
-[EMAIL]
-[PATH]
-[DOMAINS]
-[HTTP_PARAMS]
-[TYPE]
-```
-
-где:
-
-- `SERVER` - URL корневого центра сертификации (CA).
-
-Для проверки работы всей цепочки используется `stage` среда LetsEncrypt. Тогда блок принимает вид:
-```bash
---server="https://acme-staging-v02.api.letsencrypt.org/directory"
-```
-
-Для использования в "боевом" режиме блок принимает вид:
-```bash
---server="https://acme-v02.api.letsencrypt.org/directory"
-```
-
-- `TOS` - принятие текущих условий сервиса LetsEncrypt. Блок принимает вид:
-```bash
---accept-tos
-```
-
-- `EMAIL` - адрес электронной почты, используемый для регистрации и восстановления контакта. Блок принимает вид:
-```bash
---email "info@site.dev"
-```
-
-- `PATH` - каталог, используемый для хранения данных.
-
-В пути всегда должна быть папка `/ssl/`, чтобы сертификаты можно было использовать в контейнере `nginx` и прочих.  Блок принимает вид:
-```bash
---path="/ssl/site.dev/"
-```
-
-- `DOMAINS` - домен, для которого выпускаются или перевыпускаются SSL-сертификаты.
-
-Если сертификат на один домен, то блок принимает вид:
-```bash
---domains "site.dev"
-```
-
-В случае multidomain-сертификата домены можно указать несколько раз, блок принимает вид:
-```bash
---domains "shop.site.dev"
---domains "wiki.site.dev"
---domains "forum.site.dev"
-```
-
-- `HTTP_PARAMS` - обязательный блок параметров `HTTP` челленджа, нужно указать:
-```bash
---http
---http.port ":80"
-```
-
-- `TYPE` - тип команды, `run` - выпуск, `renew` - перевыпуск и т.д. Блок принимает вид:
-```bash
-run
-```
-
-Итого, собрав все воедино, получаем следующие команды:
-
-- выпуск сертификата на единственный домен `site.dev` с сохранением данных в папке `/ssl`:
-
-```bash
-/lego \
---server="https://acme-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@site.dev" \
---path="/ssl/site.dev/" \
---domains "site.dev" \
---http \
---http.port ":80" \
-run
-```
-
-- перевыпуск сертификата на домен `site.dev`:
-
-```bash
-/lego \
---server="https://acme-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@site.dev" \
---path="/ssl/site.dev/" \
---domains "site.dev" \
---http \
---http.port ":80" \
-renew
-```
-
-- выпуск сертификата для нескольких доменов (`shop.site.dev`, `wiki.site.dev`, `forum.site.dev`) с сохранением данных в папке `/ssl`, используя `stage` среду:
-
-```bash
-/lego \
---server="https://acme-staging-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@site.dev" \
---path="/ssl/site.dev/" \
---domains "shop.site.dev" \
---domains "wiki.site.dev" \
---domains "forum.site.dev" \
---http \
---http.port ":80" \
-run
-```
-
-- перевыпуск сертификата для нескольких доменов, используя `stage` среду:
-
-```bash
-/lego \
---server="https://acme-staging-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@site.dev" \
---path="/ssl/site.dev/" \
---domains "shop.site.dev" \
---domains "wiki.site.dev" \
---domains "forum.site.dev" \
---http \
---http.port ":80" \
-renew
-```
-
-<a id="legocommanddnschallenge"></a>
-#### Команда для DNS челленджа (dns-01)
-
-Общая команда `lego` для прохождения `DNS` челленджа имеет вид:
-
-```bash
-[API_STRING]
-/lego \
-[SERVER]
-[TOS]
-[EMAIL]
-[PATH]
-[DOMAINS]
-[DNS_RESOLVERS]
-[DNS_PROVIDER]
-[TYPE]
-```
-
-где:
-
-- `API_STRING` - строка с API выбранного DNS-провайдера. Приобретает разный вид в зависимости от API провайдера.
-
-Узнать параметры строки можно через справку в команде `lego` или на сайте проекта.
-
-Пример для DNS-провайдера `cloudflare`, команда:
-```bash
-/lego dnshelp --code cloudflare
-```
-
-Или документация на сайте: https://go-acme.github.io/lego/dns/cloudflare/index.html
-
-В итоге блок кода размещается до команды `/lego` и в нашем примере для DNS-провайдера `cloudflare` принимает вид:
-```bash
-CLOUDFLARE_DNS_API_TOKEN=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-```
-
-где `XXXXXXXXX...` - API токен провайдера.
-
-Для других DNS-провайдеров действуем аналогичным путем.
-
-Документацию по всем DNS-провайдерам можно изучить на сайте: https://go-acme.github.io/lego/dns/index.html
-
-- `SERVER` - URL корневого центра сертификации (CA).
-
-Для проверки работы всей цепочки используется `stage` среда LetsEncrypt. Тогда блок принимает вид:
-```bash
---server="https://acme-staging-v02.api.letsencrypt.org/directory"
-```
-
-Для использования в "боевом" режиме блок принимает вид:
-```bash
---server="https://acme-v02.api.letsencrypt.org/directory"
-```
-
-- `TOS` - принятие текущих условий сервиса LetsEncrypt. Блок принимает вид:
-```bash
---accept-tos
-```
-
-- `EMAIL` - адрес электронной почты, используемый для регистрации и восстановления контакта. Блок принимает вид:
-```bash
---email "info@site.dev"
-```
-
-- `PATH` - каталог, используемый для хранения данных.
-
-В пути всегда должна быть папка `/ssl/`, чтобы сертификаты можно было использовать в контейнере `nginx` и прочих.  Блок принимает вид:
-```bash
---path="/ssl/site.dev/"
-```
-
-- `DOMAINS` - домен, для которого выпускаются или перевыпускаются SSL-сертификаты.
-
-Если сертификат на один домен, то блок принимает вид:
-```bash
---domains "site.dev"
-```
-
-В случае multidomain-сертификата домены можно указать несколько раз, блок принимает вид:
-```bash
---domains "shop.site.dev"
---domains "wiki.site.dev"
---domains "forum.site.dev"
-```
-
-В случае wildcard-сертификата нужно указать домен и *.домен, блок принимает вид:
-```bash
---domains "site.dev"
---domains "*.site.dev"
-```
-
-- `DNS_RESOLVERS` - список DNS-резолверов, используемых для рекурсивного сканирования DNS записей домена. Одна или несколько строчек в формате `host:port`, блок принимает вид:
-```bash
---dns.resolvers 1.1.1.1:53
---dns.resolvers 8.8.8.8:53
---dns.resolvers 9.9.9.9:53
---dns.resolvers 1.0.0.1:53
---dns.resolvers 8.8.4.4:53
-```
-
-- `DNS_PROVIDER` - короткое название используемого провайдера для прохождения DNS челленджа, например, блок принимает вид:
-```bash
---dns cloudflare
-```
-Полный список всех DNS-провайдеров доступен в документации: https://go-acme.github.io/lego/dns/index.html
-
-- `TYPE` - тип команды, `run` - выпуск, `renew` - перевыпуск и т.д. Блок принимает вид:
-```bash
-run
-```
-
-Итого, собрав все воедино, получаем следующие команды (в примерах используется `cloudflare`):
-
-- выпуск сертификата на единственный домен `site.dev` с сохранением данных в папке `/ssl`, используя DNS-провайдер `cloudflare`, обращаясь к API с токеном `CLOUDFLARE_DNS_API_TOKEN`:
-
-```bash
-CLOUDFLARE_DNS_API_TOKEN=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
-/lego \
---server="https://acme-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@site.dev" \
---path="/ssl/site.dev/" \
---domains "site.dev" \
---dns.resolvers 1.1.1.1:53 \
---dns.resolvers 8.8.8.8:53 \
---dns.resolvers 9.9.9.9:53 \
---dns.resolvers 1.0.0.1:53 \
---dns.resolvers 8.8.4.4:53 \
---dns cloudflare \
-run
-```
-
-- перевыпуск сертификата на домен `site.dev`:
-
-```bash
-CLOUDFLARE_DNS_API_TOKEN=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
-/lego \
---server="https://acme-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@site.dev" \
---path="/ssl/site.dev/" \
---domains "site.dev" \
---dns.resolvers 1.1.1.1:53 \
---dns.resolvers 8.8.8.8:53 \
---dns.resolvers 9.9.9.9:53 \
---dns.resolvers 1.0.0.1:53 \
---dns.resolvers 8.8.4.4:53 \
---dns cloudflare \
-renew
-```
-
-- выпуск сертификата для нескольких доменов (`shop.site.dev`, `wiki.site.dev`, `forum.site.dev`) с сохранением данных в папке `/ssl`, используя `stage` среду и DNS-провайдер `cloudflare`, обращаясь к API с токеном `CLOUDFLARE_DNS_API_TOKEN`:
-
-```bash
-CLOUDFLARE_DNS_API_TOKEN=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
-/lego \
---server="https://acme-staging-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@site.dev" \
---path="/ssl/site.dev/" \
---domains "shop.site.dev" \
---domains "wiki.site.dev" \
---domains "forum.site.dev" \
---dns.resolvers 1.1.1.1:53 \
---dns.resolvers 8.8.8.8:53 \
---dns.resolvers 9.9.9.9:53 \
---dns.resolvers 1.0.0.1:53 \
---dns.resolvers 8.8.4.4:53 \
---dns cloudflare \
-run
-```
-
-- перевыпуск сертификата для нескольких доменов, используя `stage` среду:
-
-```bash
-CLOUDFLARE_DNS_API_TOKEN=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
-/lego \
---server="https://acme-staging-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@site.dev" \
---path="/ssl/site.dev/" \
---domains "shop.site.dev" \
---domains "wiki.site.dev" \
---domains "forum.site.dev" \
---dns.resolvers 1.1.1.1:53 \
---dns.resolvers 8.8.8.8:53 \
---dns.resolvers 9.9.9.9:53 \
---dns.resolvers 1.0.0.1:53 \
---dns.resolvers 8.8.4.4:53 \
---dns cloudflare \
-renew
-```
-
-- выпуск wildcard-сертификата на множество поддоменов основного домена (`site.dev`, `*.site.dev`) с сохранением данных в папке `/ssl`, используя DNS-провайдер `cloudflare`, обращаясь к API с токеном `CLOUDFLARE_DNS_API_TOKEN`:
-
-```bash
-CLOUDFLARE_DNS_API_TOKEN=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
-/lego \
---server="https://acme-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@site.dev" \
---path="/ssl/site.dev/" \
---domains "site.dev" \
---domains "*.site.dev" \
---dns.resolvers 1.1.1.1:53 \
---dns.resolvers 8.8.8.8:53 \
---dns.resolvers 9.9.9.9:53 \
---dns.resolvers 1.0.0.1:53 \
---dns.resolvers 8.8.4.4:53 \
---dns cloudflare \
-run
-```
-
-- перевыпуск сертификата для нескольких доменов, используя `stage` среду:
-
-```bash
-CLOUDFLARE_DNS_API_TOKEN=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
-/lego \
---server="https://acme-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@site.dev" \
---path="/ssl/site.dev/" \
---domains "site.dev" \
---domains "*.site.dev" \
---dns.resolvers 1.1.1.1:53 \
---dns.resolvers 8.8.8.8:53 \
---dns.resolvers 9.9.9.9:53 \
---dns.resolvers 1.0.0.1:53 \
---dns.resolvers 8.8.4.4:53 \
---dns cloudflare \
-renew
-```
-
-<a id="legodeploys"></a>
-### Выпуск сертификатов
-
-Рассмотрим процедуру получения SSL-сертификатов на практике.
-
-Для примера используем настоящий домен `proqacf.fun`, запустим все челленджи, получим ответы и настоящие "боевые" сертификаты для домена(ов).
-
-> [!CAUTION]
-> Внимание! Данные в публикуемых ответах слегка изменены для их безопасности.
-
-<a id="httpchallengesingledomain"></a>
-#### HTTP челлендж (http-01) для одного домена (singledomain SSL-сертификат)
-
-Запрос:
-```bash
-/lego \
---server="https://acme-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@proqacf.fun" \
---path="/ssl/singledomain.http.b24.proqacf.fun/" \
---domains "b24.proqacf.fun" \
---http \
---http.port ":80" \
-run
-```
-
-Ответ:
-```
-2025/04/30 23:17:03 No key found for account info@proqacf.fun. Generating a P256 key.
-2025/04/30 23:17:03 Saved key to /ssl/singledomain.http.b24.proqacf.fun/accounts/acme-v02.api.letsencrypt.org/info@proqacf.fun/keys/info@proqacf.fun.key
-2025/04/30 23:17:04 [INFO] acme: Registering account for info@proqacf.fun
-!!!! HEADS UP !!!!
-
-Your account credentials have been saved in your
-configuration directory at "/ssl/singledomain.http.b24.proqacf.fun/accounts".
-
-You should make a secure backup of this folder now. This
-configuration directory will also contain certificates and
-private keys obtained from the ACME server so making regular
-backups of this folder is ideal.
-2025/04/30 23:17:04 [INFO] [b24.proqacf.fun] acme: Obtaining bundled SAN certificate
-2025/04/30 23:17:05 [INFO] [b24.proqacf.fun] AuthURL: https://acme-v02.api.letsencrypt.org/acme/authz/197567964/1710482XXXX
-2025/04/30 23:17:05 [INFO] [b24.proqacf.fun] acme: Could not find solver for: tls-alpn-01
-2025/04/30 23:17:05 [INFO] [b24.proqacf.fun] acme: use http-01 solver
-2025/04/30 23:17:05 [INFO] [b24.proqacf.fun] acme: Trying to solve HTTP-01
-2025/04/30 23:17:06 [INFO] [b24.proqacf.fun] Served key authentication
-2025/04/30 23:17:06 [INFO] [b24.proqacf.fun] Served key authentication
-2025/04/30 23:17:06 [INFO] [b24.proqacf.fun] Served key authentication
-2025/04/30 23:17:06 [INFO] [b24.proqacf.fun] Served key authentication
-2025/04/30 23:17:06 [INFO] [b24.proqacf.fun] Served key authentication
-2025/04/30 23:17:13 [INFO] [b24.proqacf.fun] The server validated our request
-2025/04/30 23:17:13 [INFO] [b24.proqacf.fun] acme: Validations succeeded; requesting certificates
-2025/04/30 23:17:13 [INFO] Wait for certificate [timeout: 30s, interval: 500ms]
-2025/04/30 23:17:15 [INFO] [b24.proqacf.fun] Server responded with a certificate.
-```
-
-Последняя строка в ответе `Server responded with a certificate` означает успешное выполнение задания и выпуск SSL-сертификата.
-
-Файлы сертификатов будут расположены в папке `/ssl/singledomain.http.b24.proqacf.fun/certificates/`.
-
-<a id="httpchallengemultidomain"></a>
-#### HTTP челлендж (http-01) для множества поддоменов домена (multidomain SSL-сертификат)
-
-Запрос:
-```bash
-/lego \
---server="https://acme-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@proqacf.fun" \
---path="/ssl/multidomain.http.all.proqacf.fun/" \
---domains "b24.proqacf.fun" \
---domains "wiki.proqacf.fun" \
---domains "shop.proqacf.fun" \
---http \
---http.port ":80" \
-run
-```
-
-Ответ:
-```
-2025/04/30 23:17:30 No key found for account info@proqacf.fun. Generating a P256 key.
-2025/04/30 23:17:30 Saved key to /ssl/multidomain.http.all.proqacf.fun/accounts/acme-v02.api.letsencrypt.org/info@proqacf.fun/keys/info@proqacf.fun.key
-2025/04/30 23:17:31 [INFO] acme: Registering account for info@proqacf.fun
-!!!! HEADS UP !!!!
-
-Your account credentials have been saved in your
-configuration directory at "/ssl/multidomain.http.all.proqacf.fun/accounts".
-
-You should make a secure backup of this folder now. This
-configuration directory will also contain certificates and
-private keys obtained from the ACME server so making regular
-backups of this folder is ideal.
-2025/04/30 23:17:31 [INFO] [b24.proqacf.fun, wiki.proqacf.fun, shop.proqacf.fun] acme: Obtaining bundled SAN certificate
-2025/04/30 23:17:32 [INFO] [b24.proqacf.fun] AuthURL: https://acme-v02.api.letsencrypt.org/acme/authz/197567994/1710483XXXX
-2025/04/30 23:17:32 [INFO] [shop.proqacf.fun] AuthURL: https://acme-v02.api.letsencrypt.org/acme/authz/197567994/1710483XXXX
-2025/04/30 23:17:32 [INFO] [wiki.proqacf.fun] AuthURL: https://acme-v02.api.letsencrypt.org/acme/authz/197567994/1710483XXXX
-2025/04/30 23:17:32 [INFO] [b24.proqacf.fun] acme: Could not find solver for: tls-alpn-01
-2025/04/30 23:17:32 [INFO] [b24.proqacf.fun] acme: use http-01 solver
-2025/04/30 23:17:32 [INFO] [shop.proqacf.fun] acme: Could not find solver for: tls-alpn-01
-2025/04/30 23:17:32 [INFO] [shop.proqacf.fun] acme: use http-01 solver
-2025/04/30 23:17:32 [INFO] [wiki.proqacf.fun] acme: Could not find solver for: tls-alpn-01
-2025/04/30 23:17:32 [INFO] [wiki.proqacf.fun] acme: use http-01 solver
-2025/04/30 23:17:32 [INFO] [b24.proqacf.fun] acme: Trying to solve HTTP-01
-2025/04/30 23:17:32 [INFO] [b24.proqacf.fun] Served key authentication
-2025/04/30 23:17:33 [INFO] [b24.proqacf.fun] Served key authentication
-2025/04/30 23:17:33 [INFO] [b24.proqacf.fun] Served key authentication
-2025/04/30 23:17:33 [INFO] [b24.proqacf.fun] Served key authentication
-2025/04/30 23:17:33 [INFO] [b24.proqacf.fun] Served key authentication
-2025/04/30 23:17:35 [INFO] [b24.proqacf.fun] The server validated our request
-2025/04/30 23:17:35 [INFO] [shop.proqacf.fun] acme: Trying to solve HTTP-01
-2025/04/30 23:17:35 [INFO] [shop.proqacf.fun] Served key authentication
-2025/04/30 23:17:36 [INFO] [shop.proqacf.fun] Served key authentication
-2025/04/30 23:17:36 [INFO] [shop.proqacf.fun] Served key authentication
-2025/04/30 23:17:36 [INFO] [shop.proqacf.fun] Served key authentication
-2025/04/30 23:17:36 [INFO] [shop.proqacf.fun] Served key authentication
-2025/04/30 23:17:38 [INFO] [shop.proqacf.fun] The server validated our request
-2025/04/30 23:17:38 [INFO] [wiki.proqacf.fun] acme: Trying to solve HTTP-01
-2025/04/30 23:17:39 [INFO] [wiki.proqacf.fun] Served key authentication
-2025/04/30 23:17:39 [INFO] [wiki.proqacf.fun] Served key authentication
-2025/04/30 23:17:39 [INFO] [wiki.proqacf.fun] Served key authentication
-2025/04/30 23:17:39 [INFO] [wiki.proqacf.fun] Served key authentication
-2025/04/30 23:17:39 [INFO] [wiki.proqacf.fun] Served key authentication
-2025/04/30 23:17:43 [INFO] [wiki.proqacf.fun] The server validated our request
-2025/04/30 23:17:43 [INFO] [b24.proqacf.fun, wiki.proqacf.fun, shop.proqacf.fun] acme: Validations succeeded; requesting certificates
-2025/04/30 23:17:43 [INFO] Wait for certificate [timeout: 30s, interval: 500ms]
-2025/04/30 23:17:45 [INFO] [b24.proqacf.fun] Server responded with a certificate.
-```
-
-Последняя строка в ответе `Server responded with a certificate` означает успешное выполнение задания и выпуск SSL-сертификата.
-
-Файлы сертификатов будут расположены в папке `/ssl/multidomain.http.all.proqacf.fun/certificates/`.
-
-<a id="dnschallengesingledomain"></a>
-#### DNS челлендж (dns-01) для одного домена (singledomain SSL-сертификат)
-
-Запрос:
-```bash
-CLOUDFLARE_DNS_API_TOKEN=A3n9tXXX-BuiBd5RlITXXXXXX-5LBuWreZXXXXXX \
-/lego \
---server="https://acme-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@proqacf.fun" \
---path="/ssl/singledomain.dns.b25.proqacf.fun/" \
---domains "b25.proqacf.fun" \
---dns.resolvers 1.1.1.1:53 \
---dns.resolvers 8.8.8.8:53 \
---dns.resolvers 9.9.9.9:53 \
---dns.resolvers 1.0.0.1:53 \
---dns.resolvers 8.8.4.4:53 \
---dns cloudflare \
-run
-```
-
-Ответ:
-```
-2025/04/30 23:20:07 [INFO] [b25.proqacf.fun] acme: Obtaining bundled SAN certificate
-2025/04/30 23:20:08 [INFO] [b25.proqacf.fun] AuthURL: https://acme-v02.api.letsencrypt.org/acme/authz/197568154/1710485XXXX
-2025/04/30 23:20:08 [INFO] [b25.proqacf.fun] acme: Could not find solver for: tls-alpn-01
-2025/04/30 23:20:08 [INFO] [b25.proqacf.fun] acme: Could not find solver for: http-01
-2025/04/30 23:20:08 [INFO] [b25.proqacf.fun] acme: use dns-01 solver
-2025/04/30 23:20:08 [INFO] [b25.proqacf.fun] acme: Preparing to solve DNS-01
-2025/04/30 23:20:10 [INFO] cloudflare: new record for b25.proqacf.fun, ID fbc9f8e6f11bd574496a8d9135a4XXXX
-2025/04/30 23:20:10 [INFO] [b25.proqacf.fun] acme: Trying to solve DNS-01
-2025/04/30 23:20:11 [INFO] [b25.proqacf.fun] acme: Checking DNS record propagation. [nameservers=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53,1.0.0.1:53,8.8.4.4:53]
-2025/04/30 23:20:13 [INFO] Wait for propagation [timeout: 2m0s, interval: 2s]
-2025/04/30 23:20:13 [INFO] [b25.proqacf.fun] acme: Waiting for DNS record propagation.
-2025/04/30 23:20:15 [INFO] [b25.proqacf.fun] acme: Waiting for DNS record propagation.
-2025/04/30 23:20:20 [INFO] [b25.proqacf.fun] The server validated our request
-2025/04/30 23:20:20 [INFO] [b25.proqacf.fun] acme: Cleaning DNS-01 challenge
-2025/04/30 23:20:21 [INFO] [b25.proqacf.fun] acme: Validations succeeded; requesting certificates
-2025/04/30 23:20:21 [INFO] Wait for certificate [timeout: 30s, interval: 500ms]
-2025/04/30 23:20:24 [INFO] [b25.proqacf.fun] Server responded with a certificate.
-```
-
-Последняя строка в ответе `Server responded with a certificate` означает успешное выполнение задания и выпуск SSL-сертификата.
-
-Файлы сертификатов будут расположены в папке `/ssl/singledomain.dns.b25.proqacf.fun/`.
-
-<a id="dnschallengemultidomain"></a>
-#### DNS челлендж (dns-01) для множества поддоменов домена (multidomain SSL-сертификат)
-
-Запрос:
-```bash
-CLOUDFLARE_DNS_API_TOKEN=A3n9tXXX-BuiBd5RlITXXXXXX-5LBuWreZXXXXXX \
-/lego \
---server="https://acme-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@proqacf.fun" \
---path="/ssl/multidomain.dns.all.proqacf.fun/" \
---domains "b25.proqacf.fun" \
---domains "wiki.proqacf.fun" \
---domains "shop.proqacf.fun" \
---dns.resolvers 1.1.1.1:53 \
---dns.resolvers 8.8.8.8:53 \
---dns.resolvers 9.9.9.9:53 \
---dns.resolvers 1.0.0.1:53 \
---dns.resolvers 8.8.4.4:53 \
---dns cloudflare \
-run
-```
-
-Ответ:
-```
-2025/04/30 23:21:20 No key found for account info@proqacf.fun. Generating a P256 key.
-2025/04/30 23:21:20 Saved key to /ssl/multidomain.dns.all.proqacf.fun/accounts/acme-v02.api.letsencrypt.org/info@proqacf.fun/keys/info@proqacf.fun.key
-2025/04/30 23:21:21 [INFO] acme: Registering account for info@proqacf.fun
-!!!! HEADS UP !!!!
-
-Your account credentials have been saved in your
-configuration directory at "/ssl/multidomain.dns.all.proqacf.fun/accounts".
-
-You should make a secure backup of this folder now. This
-configuration directory will also contain certificates and
-private keys obtained from the ACME server so making regular
-backups of this folder is ideal.
-2025/04/30 23:21:21 [INFO] [b25.proqacf.fun, wiki.proqacf.fun, shop.proqacf.fun] acme: Obtaining bundled SAN certificate
-2025/04/30 23:21:22 [INFO] [b25.proqacf.fun] AuthURL: https://acme-v02.api.letsencrypt.org/acme/authz/197568584/1710486XXXX
-2025/04/30 23:21:22 [INFO] [shop.proqacf.fun] AuthURL: https://acme-v02.api.letsencrypt.org/acme/authz/197568584/1710486XXXX
-2025/04/30 23:21:22 [INFO] [wiki.proqacf.fun] AuthURL: https://acme-v02.api.letsencrypt.org/acme/authz/197568584/1710486XXXX
-2025/04/30 23:21:22 [INFO] [b25.proqacf.fun] acme: Could not find solver for: tls-alpn-01
-2025/04/30 23:21:22 [INFO] [b25.proqacf.fun] acme: Could not find solver for: http-01
-2025/04/30 23:21:22 [INFO] [b25.proqacf.fun] acme: use dns-01 solver
-2025/04/30 23:21:22 [INFO] [shop.proqacf.fun] acme: Could not find solver for: tls-alpn-01
-2025/04/30 23:21:22 [INFO] [shop.proqacf.fun] acme: Could not find solver for: http-01
-2025/04/30 23:21:22 [INFO] [shop.proqacf.fun] acme: use dns-01 solver
-2025/04/30 23:21:22 [INFO] [wiki.proqacf.fun] acme: Could not find solver for: tls-alpn-01
-2025/04/30 23:21:22 [INFO] [wiki.proqacf.fun] acme: Could not find solver for: http-01
-2025/04/30 23:21:22 [INFO] [wiki.proqacf.fun] acme: use dns-01 solver
-2025/04/30 23:21:22 [INFO] [b25.proqacf.fun] acme: Preparing to solve DNS-01
-2025/04/30 23:21:25 [INFO] cloudflare: new record for b25.proqacf.fun, ID d7988d0a8952175b7480b2636065XXXX
-2025/04/30 23:21:25 [INFO] [shop.proqacf.fun] acme: Preparing to solve DNS-01
-2025/04/30 23:21:26 [INFO] cloudflare: new record for shop.proqacf.fun, ID e202bae64f3cb22c8ae543fb6563XXXX
-2025/04/30 23:21:26 [INFO] [wiki.proqacf.fun] acme: Preparing to solve DNS-01
-2025/04/30 23:21:27 [INFO] cloudflare: new record for wiki.proqacf.fun, ID e7c3e21d948f97315cb4cb6c4f1dXXXX
-2025/04/30 23:21:27 [INFO] [b25.proqacf.fun] acme: Trying to solve DNS-01
-2025/04/30 23:21:27 [INFO] [b25.proqacf.fun] acme: Checking DNS record propagation. [nameservers=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53,1.0.0.1:53,8.8.4.4:53]
-2025/04/30 23:21:29 [INFO] Wait for propagation [timeout: 2m0s, interval: 2s]
-2025/04/30 23:21:29 [INFO] [b25.proqacf.fun] acme: Waiting for DNS record propagation.
-2025/04/30 23:21:38 [INFO] [b25.proqacf.fun] The server validated our request
-2025/04/30 23:21:38 [INFO] [shop.proqacf.fun] acme: Trying to solve DNS-01
-2025/04/30 23:21:38 [INFO] [shop.proqacf.fun] acme: Checking DNS record propagation. [nameservers=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53,1.0.0.1:53,8.8.4.4:53]
-2025/04/30 23:21:40 [INFO] Wait for propagation [timeout: 2m0s, interval: 2s]
-2025/04/30 23:21:40 [INFO] [shop.proqacf.fun] acme: Waiting for DNS record propagation.
-2025/04/30 23:21:42 [INFO] [shop.proqacf.fun] acme: Waiting for DNS record propagation.
-2025/04/30 23:21:45 [INFO] [shop.proqacf.fun] acme: Waiting for DNS record propagation.
-2025/04/30 23:21:47 [INFO] [shop.proqacf.fun] acme: Waiting for DNS record propagation.
-2025/04/30 23:21:49 [INFO] [shop.proqacf.fun] acme: Waiting for DNS record propagation.
-2025/04/30 23:21:55 [INFO] [shop.proqacf.fun] The server validated our request
-2025/04/30 23:21:55 [INFO] [wiki.proqacf.fun] acme: Trying to solve DNS-01
-2025/04/30 23:21:55 [INFO] [wiki.proqacf.fun] acme: Checking DNS record propagation. [nameservers=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53,1.0.0.1:53,8.8.4.4:53]
-2025/04/30 23:21:57 [INFO] Wait for propagation [timeout: 2m0s, interval: 2s]
-2025/04/30 23:22:03 [INFO] [wiki.proqacf.fun] The server validated our request
-2025/04/30 23:22:03 [INFO] [b25.proqacf.fun] acme: Cleaning DNS-01 challenge
-2025/04/30 23:22:04 [INFO] [shop.proqacf.fun] acme: Cleaning DNS-01 challenge
-2025/04/30 23:22:05 [INFO] [wiki.proqacf.fun] acme: Cleaning DNS-01 challenge
-2025/04/30 23:22:06 [INFO] [b25.proqacf.fun, wiki.proqacf.fun, shop.proqacf.fun] acme: Validations succeeded; requesting certificates
-2025/04/30 23:22:06 [INFO] Wait for certificate [timeout: 30s, interval: 500ms]
-2025/04/30 23:22:09 [INFO] [b25.proqacf.fun] Server responded with a certificate.
-```
-
-Последняя строка в ответе `Server responded with a certificate` означает успешное выполнение задания и выпуск SSL-сертификата.
-
-Файлы сертификатов будут расположены в папке `/ssl/multidomain.dns.all.proqacf.fun/`.
-
-<a id="dnschallengewildcard"></a>
-#### DNS челлендж (dns-01) на все множество поддоменных имен (*) домена (wildcard SSL-сертификат)
-
-Запрос:
-```bash
-CLOUDFLARE_DNS_API_TOKEN=A3n9tXXX-BuiBd5RlITXXXXXX-5LBuWreZXXXXXX \
-/lego \
---server="https://acme-v02.api.letsencrypt.org/directory" \
---accept-tos \
---email "info@proqacf.fun" \
---path="/ssl/wildcard.dns.proqacf.fun/" \
---domains "proqacf.fun" \
---domains "*.proqacf.fun" \
---dns.resolvers 1.1.1.1:53 \
---dns.resolvers 8.8.8.8:53 \
---dns.resolvers 9.9.9.9:53 \
---dns.resolvers 1.0.0.1:53 \
---dns.resolvers 8.8.4.4:53 \
---dns cloudflare \
-run
-```
-
-Ответ:
-```
-2025/04/30 23:24:23 No key found for account info@proqacf.fun. Generating a P256 key.
-2025/04/30 23:24:23 Saved key to /ssl/wildcard.dns.proqacf.fun/accounts/acme-v02.api.letsencrypt.org/info@proqacf.fun/keys/info@proqacf.fun.key
-2025/04/30 23:24:24 [INFO] acme: Registering account for info@proqacf.fun
-!!!! HEADS UP !!!!
-
-Your account credentials have been saved in your
-configuration directory at "/ssl/wildcard.dns.proqacf.fun/accounts".
-
-You should make a secure backup of this folder now. This
-configuration directory will also contain certificates and
-private keys obtained from the ACME server so making regular
-backups of this folder is ideal.
-2025/04/30 23:24:24 [INFO] [proqacf.fun, *.proqacf.fun] acme: Obtaining bundled SAN certificate
-2025/04/30 23:24:25 [INFO] [*.proqacf.fun] AuthURL: https://acme-v02.api.letsencrypt.org/acme/authz/197568934/1710489XXXX
-2025/04/30 23:24:25 [INFO] [proqacf.fun] AuthURL: https://acme-v02.api.letsencrypt.org/acme/authz/197568934/1710489XXXX
-2025/04/30 23:24:25 [INFO] [*.proqacf.fun] acme: use dns-01 solver
-2025/04/30 23:24:25 [INFO] [proqacf.fun] acme: Could not find solver for: tls-alpn-01
-2025/04/30 23:24:25 [INFO] [proqacf.fun] acme: Could not find solver for: http-01
-2025/04/30 23:24:25 [INFO] [proqacf.fun] acme: use dns-01 solver
-2025/04/30 23:24:25 [INFO] [*.proqacf.fun] acme: Preparing to solve DNS-01
-2025/04/30 23:24:27 [INFO] cloudflare: new record for proqacf.fun, ID 89d9516b6d1eb7c3dab27a614e2cXXXX
-2025/04/30 23:24:27 [INFO] [proqacf.fun] acme: Preparing to solve DNS-01
-2025/04/30 23:24:28 [INFO] cloudflare: new record for proqacf.fun, ID f6b4267536ad6391637367c10c27XXXX
-2025/04/30 23:24:28 [INFO] [*.proqacf.fun] acme: Trying to solve DNS-01
-2025/04/30 23:24:28 [INFO] [*.proqacf.fun] acme: Checking DNS record propagation. [nameservers=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53,1.0.0.1:53,8.8.4.4:53]
-2025/04/30 23:24:30 [INFO] Wait for propagation [timeout: 2m0s, interval: 2s]
-2025/04/30 23:24:30 [INFO] [*.proqacf.fun] acme: Waiting for DNS record propagation.
-2025/04/30 23:24:33 [INFO] [*.proqacf.fun] acme: Waiting for DNS record propagation.
-2025/04/30 23:24:40 [INFO] [*.proqacf.fun] The server validated our request
-2025/04/30 23:24:40 [INFO] [proqacf.fun] acme: Trying to solve DNS-01
-2025/04/30 23:24:40 [INFO] [proqacf.fun] acme: Checking DNS record propagation. [nameservers=1.1.1.1:53,8.8.8.8:53,9.9.9.9:53,1.0.0.1:53,8.8.4.4:53]
-2025/04/30 23:24:42 [INFO] Wait for propagation [timeout: 2m0s, interval: 2s]
-2025/04/30 23:24:49 [INFO] [proqacf.fun] The server validated our request
-2025/04/30 23:24:49 [INFO] [*.proqacf.fun] acme: Cleaning DNS-01 challenge
-2025/04/30 23:24:50 [INFO] [proqacf.fun] acme: Cleaning DNS-01 challenge
-2025/04/30 23:24:50 [INFO] [proqacf.fun, *.proqacf.fun] acme: Validations succeeded; requesting certificates
-2025/04/30 23:24:50 [INFO] Wait for certificate [timeout: 30s, interval: 500ms]
-2025/04/30 23:24:53 [INFO] [proqacf.fun] Server responded with a certificate.
-```
-
-Последняя строка в ответе `Server responded with a certificate` означает успешное выполнение задания и выпуск SSL-сертификата.
-
-Файлы сертификатов будут расположены в папке `/ssl/wildcard.dns.proqacf.fun/`.
-
-<a id="installpresentcerts"></a>
-### Установка сертификатов
-
-После выпуска SSL-сертификатов одним из способов выше нам нужно в SSL конфигурацию `nginx` прописать новые сертификаты.
-
-Пример ниже для домена `proqacf.fun`, wildcard-сертификаты выпущены и содержатся в папке `/ssl/wildcard.dns.proqacf.fun/`.
-
-Заходим в sh-консоль контейнера `nginx` из-под пользователя `root`:
-```bash
-docker compose exec --user=root nginx sh
-```
-
-Выполняем:
-```bash
-apk add mc
-exit
-```
-
-Заходим в sh-консоль контейнера `nginx` из-под пользователя `bitrix`:
-```bash
-docker compose exec --user=bitrix nginx sh
-```
-
-Редактируем файл `/etc/nginx/ssl/ssl.conf`:
-```bash
-mcedit /etc/nginx/ssl/ssl.conf
-```
-
-Меняем настройки для опций `ssl_*`:
-```bash
-ssl_certificate /ssl/wildcard.dns.proqacf.fun/certificates/proqacf.fun.crt;
-ssl_certificate_key /ssl/wildcard.dns.proqacf.fun/certificates/proqacf.fun.key;
-ssl_trusted_certificate /ssl/wildcard.dns.proqacf.fun/certificates/proqacf.fun.issuer.crt;
-ssl_dhparam /ssl/dhparam.pem;
-```
-
-Выходим из консоли контейнера и проверяем настройки `nginx`:
-```bash
-docker compose exec --user=bitrix nginx sh -c "nginx -t"
-```
-
-Если никаких ошибок нет, перезапускаем контейнер `nginx`:
-```bash
-docker compose restart nginx
-```
-
-Итог: после настройки выше переходим на сайт по URL с доменом `b24.proqacf.fun`, используя `https` и порт `8589` в URL:
-```bash
-https://b24.proqacf.fun:8589/
-```
-
-Работа сайта перешла на безопасную схему, используется `https`, `ssl`, `wss` и т.д. Никаких дополнительных манипуляций внутри контейнеров не требуется.
-
-<a id="servicesconsole"></a>
-# Консоль сервисов
-
-<a id="containerconsole"></a>
-## Контейнер
-
-Для входа в консоль контейнера используется следующий шаблон команды:
-```bash
-docker compose exec [--user=[пользователь]] [сервис] [оболочка]
-```
-
-Где:
-- `пользователь`: пользователь ОС внутри контейнера:
-  - если пусто и ничего не указывать, берется поведение по умолчанию
-  - для пользователя `bitrix` шаблон команды принимает вид `--user=bitrix`
-  - для пользователя `root` шаблон команды выглядит как `--user=root`
-- `сервис`: имя сервиса, указанное в файле `docker-compose.yml`, пример `mysql`, `nginx`, `php` и т.д.
-- `оболочка`: тип запускаемой оболочки внутри контейнера, пример `sh`, `bash`, `ash` и т.д.
-
-В результате возможны варианты вида:
-
-- заходим в bash-консоль контейнера `mysql`, пользователя не указываем:
-```bash
-docker compose exec mysql bash
-```
-
-- заходим в sh-консоль контейнера `php` из-под пользователя `bitrix`:
-```bash
-docker compose exec --user=bitrix php sh
-```
-
-- заходим в sh-консоль контейнера `php` из-под пользователя `root`:
-```bash
-docker compose exec --user=root php sh
-```
-
-Также можно выполнять команды, указав параметр `-c` и саму команду, пример запроса `id`:
-```bash
-docker compose exec --user=root redis sh -c "id"
-```
-
-<a id="mysqlconsole"></a>
-## MySQL
-
-Заходим в bash-консоль контейнера `mysql`, выполняя команду входа в консоль `mysql` из-под пользователя `root` базы данных:
-```bash
-docker compose exec mysql bash -c "mysql -u root -p"
-```
-
-Вводим пароль суперпользователя `root`, который был создан вами в главе [Пароли к базам данных MySQL и PostgreSQL](#databasespasswords). Его значение хранится в файле `.env_sql`.
-
-Выполняем SQL-запросы. Для выхода вводим `exit`.
-
-<a id="postgresqlconsole"></a>
-## PostgreSQL
-
-Заходим в bash-консоль контейнера `postgres`, выполняя команду входа в консоль `psql` из-под пользователя `postgres` базы данных:
-```bash
-docker compose exec --user=postgres postgres bash -c "psql"
-```
-
-Вводим пароль суперпользователя `postgres`, который был создан вами в главе [Пароли к базам данных MySQL и PostgreSQL](#databasespasswords). Его значение хранится в файле `.env_sql`.
-
-Выполняем SQL-запросы. Для выхода вводим `\q`.
-
-<a id="memcacheconsole"></a>
-## Memcache
-
-Заходим в sh-консоль контейнера `memcached`, запуская консоль `nc`, указывая хост `127.0.0.1` и порт `11211`:
-```bash
-docker compose exec --user=root memcached sh -c "nc 127.0.0.1 11211"
-```
-
-Выполняем запросы (пример, `stats`). Для выхода вводим `exit`.
-
-<a id="redisconsole"></a>
-## Redis
-
-Заходим в sh-консоль контейнера `redis`, запуская консоль `redis-cli`, указывая хост `127.0.0.1` и порт `6379`:
-```bash
-docker compose exec --user=root redis sh -c "redis-cli -h 127.0.0.1 -p 6379"
-```
-
-Выполняем запросы (пример, `ping` или `KEYS *`). Для выхода вводим `exit`.
+Не забудьте про часовой пояс в файле `confs/php8X/etc/php/conf.d/timezone.ini` выбранной версии.
 
 <a id="customization"></a>
-# Кастомизация
+## Кастомизация
 
-Конечно же, встает вопрос "как мне запустить свои разработки" рядом с проектом или внутри него.
+Свои сервисы можно запускать двумя способами:
 
-Есть два пути, позволяющие это сделать:
+1. отдельным файлом `docker-compose-my.yml`, тогда команды пишутся с указанием обоих файлов:
 
-- создать отдельный `docker-compose-my.yml` файл, разместить код внутри файла - описать тома, сервисы, сеть и т.д.
-
-Тогда во всех командах указываем `.yml` файлы через опцию `-f`, пример:
 ```bash
 docker compose -f docker-compose.yml -f docker-compose-my.yml ps
 ```
 
-- интеграция в существующий `docker-compose.yml` файл проекта - добавить тома, сервисы, указать сеть и т.д.
+2. добавлением сервиса в существующий `docker-compose.yml`.
 
-Для примера, запустим [Valkey](https://hub.docker.com/r/valkey/valkey/), добавив его в проект в существующий `yml` файл.
+Пример: добавляем [Valkey](https://hub.docker.com/r/valkey/valkey/).
 
-На странице valkey на DockerHub-е находим нужный нам тег, пример `7.2.12-alpine`.
+В раздел `volumes`:
 
-Редактируем `docker-compose.yml` файл:
-
-- в раздел `volumes` добавляем описание тома:
-```bash
+```yaml
   valkey_data:
     driver: local
 ```
 
-- в раздел `services` добавляем описание сервиса:
-```bash
+В раздел `services`:
+
+```yaml
   valkey:
     image: valkey/valkey:7.2.12-alpine
     container_name: dev_valkey
@@ -2990,228 +1995,40 @@ docker compose -f docker-compose.yml -f docker-compose-my.yml ps
           - valkey
 ```
 
-Запускаем контейнеры, оставляем их работать в фоне:
+Запускаем и проверяем:
+
 ```bash
 docker compose up -d
+docker compose exec --user=root valkey sh -c "valkey-cli -h 127.0.0.1 -p 6379 ping"
 ```
-
-Заходим в sh-консоль контейнера `valkey`, запуская консоль `valkey-cli`, указывая хост `127.0.0.1` и порт `6379`:
-```bash
-docker compose exec --user=root valkey sh -c "valkey-cli -h 127.0.0.1 -p 6379"
-```
-
-Выполняем запросы (пример, `ping` или `KEYS *`). Выходим `exit`.
-
-Итого: мы успешно запустили новый контейнер `valkey`, проверили его работу. Теперь его можно использовать для хранения кеша или хранения сессий по примеру, как описано выше в главе [Memcache и Redis](#memcacheandredis).
-
-<a id="softwareversions"></a>
-# Версии ПО
-
-<a id="currentversions"></a>
-## Текущие версии
-
-По умолчанию в проекте используются следующие программы и их версии:
-```bash
-Memcached 1.6.x
-Redis 8.2.x
-PostgreSQL 16.x
-Percona Server 8.0.x
-PHP 8.2.x
-Nginx 1.30.x
-Sphinx 2.2.11
-Lego 4.35.x
-```
-
-<a id="alternativeversions"></a>
-## Альтернативные версии
-
-Проект позволяет использовать альтернативные версии программ в случае, если текущие версии не удовлетворяют требованиям.
-
-<a id="redisalternativeversions"></a>
-### Redis
-
-Доступные альтернативные версии Redis: `7.2.x`, `7.4.x`, `8.0.x`, `8.4.x`, `8.6.x`, `8.8.x`.
-
-Разберем пример использования версии `8.4.x` вместо текущей версии `8.2.x`.
-
-До первого запуска проекта редактируем файл `docker-compose.yml`, в разделе `services` находим сервис `redis`. В строку с текущей версией `8.2.x` добавляем `#`, в строке с версией `8.4.x` убираем `#`. Итоговый вид:
-```bash
-#image: redis:7.2.14-alpine
-#image: redis:7.4.9-alpine
-#image: redis:8.0.6-alpine
-#image: redis:8.2.7-alpine
-image: redis:8.4.4-alpine
-#image: redis:8.6.4-alpine
-#image: redis:8.8.0-alpine
-```
-
-Запускаем все контейнеры, оставляем их работать в фоне:
-```bash
-docker compose up -d
-```
-
-Таким образом Redis будет использовать контейнер с версией `8.4.4`.
-
-Для версий `7.2.x`, `7.4.x`, `8.0.x`, `8.6.x`, `8.8.x` настройку выполняем аналогичным образом.
-
-<a id="postgresqlalternativeversions"></a>
-### PostgreSQL
-
-Доступные альтернативные версии PostgreSQL: `14.x`, `15.x`, `17.x`, `18.x`.
-
-Разберем пример использования версии `17.x` вместо текущей версии `16.x`.
-
-До первого запуска проекта редактируем файл `docker-compose.yml`, в разделе `services` находим сервис `postgres`. В строку с текущей версией `16.x` добавляем `#`, в строке с версией `17.x` убираем `#`. Итоговый вид:
-```bash
-#image: postgres:14.23-trixie
-#image: postgres:15.18-trixie
-#image: postgres:16.14-trixie
-image: postgres:17.10-trixie
-#image: postgres:18.4-trixie
-```
-
-Запускаем все контейнеры, оставляем их работать в фоне:
-```bash
-docker compose up -d
-```
-
-Таким образом PostgreSQL будет использовать контейнер с версией `17.10`.
-
-Для версий `14.x`, `15.x`, `18.x` настройку выполняем аналогичные образом.
-
-> [!CAUTION]
-> Внимание! В образах PostgreSQL с версии `18.x` изменился путь, используемый для тома с данными этой базы.
->
-> При использовании версии `18.x` до первого запуска проекта редактируем файл `docker-compose.yml`, в разделе `services` находим сервис `postgres`.
-> В списке томов `volumes` находим строку `- postgres_data:/var/lib/postgresql/data` добавляем `#`, в строке ниже `- postgres_data:/var/lib/postgresql` убираем `#`.
-
-<a id="mysqlalternativeversions"></a>
-### MySQL
-
-Доступные альтернативные версии MySQL (Percona Server): `8.4.x`.
-
-Разберем пример использования версии `8.4.x` вместо текущей версии `8.0.x`.
-
-До первого запуска проекта редактируем файл `docker-compose.yml`, в разделе `services` находим сервис `mysql`. В строку с текущей версией `8.0.x` добавляем `#`, в строке с версией `8.4.x` убираем `#`. Итоговый вид:
-```bash
-#image: quay.io/bitrix24/percona-server:8.0.46-v1-rhel
-image: quay.io/bitrix24/percona-server:8.4.10-v1-rhel
-```
-
-Запускаем все контейнеры, оставляем их работать в фоне:
-```bash
-docker compose up -d
-```
-
-Таким образом MySQL будет использовать контейнер с версией `8.4.10`.
-
-<a id="phpandcronalternativeversions"></a>
-### PHP и Cron
-
-Доступные альтернативные версии PHP: `8.3.x`, `8.4.x`, `8.5.x`.
-
-Разберем пример использования версии `8.3.x` вместо текущей версии `8.2.x`.
-
-До первого запуска проекта редактируем файл `docker-compose.yml`, в разделе `services` находим сервис `php`.
-
-В строку с текущей версией `8.2.x` добавляем `#`, в строке с версией `8.3.x` убираем `#`:
-```bash
-php:
-#image: quay.io/bitrix24/php:8.2.32-fpm-v1-alpine
-image: quay.io/bitrix24/php:8.3.32-fpm-v1-alpine
-#image: quay.io/bitrix24/php:8.4.23-fpm-v1-alpine
-#image: quay.io/bitrix24/php:8.5.8-fpm-v1-alpine
-```
-
-В секции `volumes` в строку с текущей версией `.../82/...` добавляем `#`, в строке с версией `.../83/...` убираем `#`:
-```bash
-volumes:
-#- ./confs/php82/etc/:/usr/local/etc/
-- ./confs/php83/etc/:/usr/local/etc/
-#- ./confs/php84/etc/:/usr/local/etc/
-#- ./confs/php85/etc/:/usr/local/etc/
-```
-
-Продолжаем редактировать файл `docker-compose.yml`, в разделе `services` находим сервис `cron`. Повторяем настройку таким же образом, как описано для сервиса `php` выше.
-
-Запускаем все контейнеры, оставляем их работать в фоне:
-```bash
-docker compose up -d
-```
-
-Таким образом PHP и Cron будут использовать контейнеры с версией `8.3.x`. Читать и применять настройки из одного каталога для версии `8.3.x`.
-
-Для версий `8.4.x` и `8.5.x` все шаги выше выполняем аналогичным образом.
 
 <a id="dockerimages"></a>
-# Сборка или скачивание Docker образов
+## Сборка или скачивание Docker образов
 
-Наша цель - подготовить или собрать максимально совместимые и готовые образы для продуктов компании 1С-Битрикс, запускающие набор ПО в контейнерах.
+Цель - подготовить максимально совместимые образы для продуктов 1С-Битрикс.
 
-<a id="basicimages"></a>
-## Базовые образы
+### Базовые образы
 
-Там где возможно будем использовать официальные Docker образы ПО, теги для которых будем брать с [DockerHub](https://hub.docker.com/):
-- `PostgreSQL`: https://hub.docker.com/_/postgres
-- `Redis`: https://hub.docker.com/_/redis
-- `Memcached`: https://hub.docker.com/_/memcached
+Там, где возможно, используются официальные образы с [DockerHub](https://hub.docker.com/):
 
-В этот список попадают (формат `название`:`полный_тег_с_указанием_версии_и_ос`):
-- `postgres:16.14-trixie`
-- `redis:8.2.7-alpine`
-- `memcached:1.6.45-alpine`
-
-Можно предварительно скачать ПО из списка выше с помощью команд:
 ```bash
-docker pull postgres:16.14-trixie
 docker pull redis:8.2.7-alpine
 docker pull memcached:1.6.45-alpine
 ```
 
-<a id="bitriximages"></a>
-## Битрикс образы
+### Битрикс образы
 
 > [!CAUTION]
-> Внимание! Сборку образов необходимо проводить в продукте `Docker Desktop` в связи с наличием в сборщике двух архитектур: `x86_64` (для `amd64`) и `aarch64` (для `arm64`).
+> Внимание! Сборку образов необходимо проводить в `Docker Desktop` - в сборщике участвуют две архитектуры: `x86_64` (для `amd64`) и `aarch64` (для `arm64`).
 
-Также нам понадобятся:
-- база данных MySQL:
-  - используем стабильный образ `percona/percona-server:8.0.46` / `percona/percona-server:8.4.10`
-  - добавляем слоем сверху конфигурацию бд
-  - собираем `bitrix24/percona-server:8.0.46-v1-rhel` / `bitrix24/percona-server:8.4.10-v1-rhel`
-- веб-сервер:
-  - используем стабильный образ `nginx:1.30.4-alpine-slim`
-  - добавляем модули слоем сверху
-  - собираем `bitrix24/nginx:1.30.4-v1-alpine`
-- интерпретатор PHP-кода:
-  - готового совместимого образа PHP нет
-  - берем по умолчанию образ `php:8.2.32-fpm-alpine3.23` / `php:8.3.32-fpm-alpine3.23` / `php:8.4.23-fpm-alpine3.23` / `php:8.5.8-fpm-alpine3.23` и добавляем то, что нам надо через пару слоев сверху
-  - собираем `bitrix24/php:8.2.32-fpm-v1-alpine` / `bitrix24/php:8.3.32-fpm-v1-alpine` / `bitrix24/php:8.4.23-fpm-v1-alpine` / `bitrix24/php:8.5.8-fpm-v1-alpine`
-- поиск:
-  - готового образа Sphinx нет, но есть собранный пакет `sphinx` на базе `Alpine Linux` в официальном репозитории ОС
-  - собираем `bitrix24/sphinx:2.2.11-v2-alpine`, установив пакет
-- Push-сервер:
-  - готового образа нет
-  - используем образ NodeJS 22-ой версии
-  - используем исходники `push-server-0.6.0`
-  - собираем `bitrix24/push:3.3-v1-alpine`
-- сервис для бесплатных SSL-сертификатов от `LetsEncrypt`:
-  - используем стабильный образ `goacme/lego:v4.35.2`
-  - добавляем логику слоем сверху
-  - собираем `bitrix24/lego:4.35.2-v1-alpine`
-- генератор самоподписных SSL-сертификатов:
-  - небольшой образ с пакетами на базе `Alpine Linux`
-  - собираем `bitrix24/ssl:1.2-v1-alpine`
+Что собирается поверх официальных образов:
+- база данных: `percona/percona-server:8.0.46` / `8.4.10` + конфигурация -> `bitrix24/percona-server:8.0.46-v1-rhel` / `8.4.10-v1-rhel`;
+- веб-сервер: `nginx:1.30.4-alpine-slim` + модули -> `bitrix24/nginx:1.30.4-v1-alpine`;
+- PHP: `php:8.2.32-fpm-alpine3.23` (и аналоги 8.3/8.4/8.5) + расширения и утилиты -> `bitrix24/php:8.2.32-fpm-v1-alpine` и т.д.;
+- поиск: пакет `sphinx` из репозитория `Alpine Linux` -> `bitrix24/sphinx:2.2.11-v2-alpine`.
 
-Список официальных Docker образов, которые будем брать с [DockerHub](https://hub.docker.com/):
-- `Percona Server`: https://hub.docker.com/r/percona/percona-server
-- `Nginx`: https://hub.docker.com/_/nginx
-- `PHP`: https://hub.docker.com/_/php
-- `NodeJS`: https://hub.docker.com/_/node
-- `Alpine`: https://hub.docker.com/_/alpine
-- `Lego`: https://hub.docker.com/r/goacme/lego
+Предварительное скачивание базовых образов:
 
-Для сборки нам понадобятся следующие образы (их можно предварительно скачать, используя команды):
 ```bash
 docker pull percona/percona-server:8.0.46
 docker pull percona/percona-server:8.4.10
@@ -3220,16 +2037,10 @@ docker pull php:8.2.32-fpm-alpine3.23
 docker pull php:8.3.32-fpm-alpine3.23
 docker pull php:8.4.23-fpm-alpine3.23
 docker pull php:8.5.8-fpm-alpine3.23
-docker pull node:22
-docker pull node:22-alpine
-docker pull alpine:3.21
-docker pull alpine:3.22
 docker pull alpine:3.23
-docker pull alpine:3.24
-docker pull goacme/lego:v4.35.2
 ```
 
-Собираем образы, в названии используем `bitrix24`:
+Команды сборки:
 
 - `bitrix24/sphinx`:
 ```bash
@@ -3237,34 +2048,10 @@ cd env-docker/sources/bxsphinx2211/v2/
 docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/sphinx:2.2.11-v2-alpine --no-cache .
 ```
 
-- `bitrix24/push`:
-```bash
-cd env-docker/sources/bxpush33/
-docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/push:3.3-v1-alpine --no-cache .
-```
-
-- `bitrix24/php` для версии `8.2.x`:
+- `bitrix24/php` (пример для `8.2.x`, для других версий - каталоги `bxphp8332`, `bxphp8423`, `bxphp858`):
 ```bash
 cd env-docker/sources/bxphp8232/
 docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/php:8.2.32-fpm-v1-alpine --no-cache .
-```
-
-- `bitrix24/php` для версии `8.3.x`:
-```bash
-cd env-docker/sources/bxphp8332/
-docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/php:8.3.32-fpm-v1-alpine --no-cache .
-```
-
-- `bitrix24/php` для версии `8.4.x`:
-```bash
-cd env-docker/sources/bxphp8423/
-docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/php:8.4.23-fpm-v1-alpine --no-cache .
-```
-
-- `bitrix24/php` для версии `8.5.x`:
-```bash
-cd env-docker/sources/bxphp858/
-docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/php:8.5.8-fpm-v1-alpine --no-cache .
 ```
 
 - `bitrix24/nginx`:
@@ -3273,92 +2060,43 @@ cd env-docker/sources/bxnginx1304/
 docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/nginx:1.30.4-v1-alpine --no-cache .
 ```
 
-- `bitrix24/percona-server` для версии `8.0.x`:
+- `bitrix24/percona-server`:
 ```bash
 cd env-docker/sources/bxpercona8046/
 docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/percona-server:8.0.46-v1-rhel --no-cache .
 ```
 
-- `bitrix24/percona-server` для версии `8.4.x`:
 ```bash
 cd env-docker/sources/bxpercona8410/
 docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/percona-server:8.4.10-v1-rhel --no-cache .
 ```
 
-- `bitrix24/lego`:
-```bash
-cd env-docker/sources/bxlego4352/
-docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/lego:4.35.2-v1-alpine --no-cache .
-```
+В тегах образов `bitrix24` часть `v1` означает общую отметку версии (`v`) и номер сборки (`1`).
 
-- `bitrix24/ssl`:
-```bash
-cd env-docker/sources/bxssl12/
-docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/ssl:1.2-v1-alpine --no-cache .
-```
-
-Во всех образах `bitrix24` в названии тега указывается `v1`, состоит из:
-- общая отметка версии, указывается буквой `v`
-- номер сборки, начинается с цифры `1`
-
-<a id="nginxmodulesimage"></a>
-## Модули для Nginx
+### Модули для Nginx
 
 > [!CAUTION]
-> Внимание! Информация о сборке модулей для Nginx предоставляется для ознакомления. Повторять шаги ниже не требуется.
+> Внимание! Информация о сборке модулей приведена для ознакомления. Повторять эти шаги для развертывания сайта не требуется.
 
-В образе веб-сервера `bitrix24/nginx` используются следующие модули:
-- `acme`
-- `brotli`
-- `geoip`
-- `geoip2`
-- `headers-more`
-- `image-filter`
-- `lua`
-- `ndk`
-- `njs`
-- `perl`
-- `xslt`
-- `zip`
+В образе `bitrix24/nginx` доступны модули: `acme`, `brotli`, `geoip`, `geoip2`, `headers-more`, `image-filter`, `lua`, `ndk`, `njs`, `perl`, `xslt`, `zip`.
 
-Модули собираются на базе стабильного образа `nginx:1.30.4-alpine-slim`, используя официальный образ Nginx с [DockerHub](https://hub.docker.com/):
-- `Nginx`: https://hub.docker.com/_/nginx
+Модули собираются на базе `nginx:1.30.4-alpine-slim`. Потребуется `Dockerfile` от соответствующей версии с [GitHub](https://github.com/nginx/docker-nginx), пример модификаций - в каталоге `sources/bxnginx1304modules/v1/`.
 
-Образ Nginx можно предварительно скачать, используя команду:
-```bash
-docker pull nginx:1.30.4-alpine-slim
-```
-
-Для сборки потребуется `Dockerfile` от версии `1.30.4`, найти который можно на [GitHub](https://github.com/nginx/docker-nginx).
-
-Скачиваем файл для версии 1.30.4 по ссылке: [https://raw.githubusercontent.com/nginx/docker-nginx/ccdab6c99ae2e2fc53a144dc68d6b8f44163adf2/stable/alpine/Dockerfile](https://raw.githubusercontent.com/nginx/docker-nginx/ccdab6c99ae2e2fc53a144dc68d6b8f44163adf2/stable/alpine/Dockerfile)
-
-Модифицируем файл, добавляем нужные модули по списку выше и служебную часть. Пример всех изменений файла для версии 1.30.4 можно найти в папке `/sources/bxnginx1304modules/v1/`.
-
-Запускаем сборку образа `nginx_modules`, указываем две архитектуры `amd64` и `arm64` в команде:
+Сборка образа со сборщиком модулей:
 
 ```bash
 cd env-docker/sources/bxnginx1304modules/v1/
 docker buildx build --platform linux/arm64,linux/amd64 --provenance=false -f Dockerfile -t bitrix24/nginx_modules:1.30.4-v1-alpine --no-cache .
 ```
 
-После нужно запустить два контейнера, используя собранный образ выше. По одному для каждой архитектуры: `amd64` и `arm64`.
+Затем запускаются два контейнера - по одному на архитектуру:
 
-Для `amd64` выполняем команду:
 ```bash
 docker run --platform=linux/amd64 -d --name=nginxmodules1304testingamd64 -it bitrix24/nginx_modules:1.30.4-v1-alpine
-```
-
-Для `arm64` выполняем команду:
-```bash
 docker run --platform=linux/arm64 -d --name=nginxmodules1304testingarm64 -it bitrix24/nginx_modules:1.30.4-v1-alpine
 ```
 
-Собранные модули Nginx будут доступны в каталоге `/root/packages/` у каждого запущенного контейнера.
-
-Внутри контейнера переходим в каталог `/root/packages/`, архивируем содержимое и забираем zip-файл:
-
-- для `amd64` выполняем:
+Собранные модули лежат в каталоге `/root/packages/` каждого контейнера, забираются архивом:
 
 ```bash
 apk add mc zip
@@ -3367,118 +2105,171 @@ zip -r nginxmodules_amd64.zip *
 exit
 ```
 
-- для `arm64` выполняем:
+После контейнеры останавливаются и удаляются:
 
-```bash
-apk add mc zip
-cd /root/packages/
-zip -r nginxmodules_arm64.zip *
-exit
-```
-
-Останавливаем и удаляем контейнеры, они больше не нужны.
-
-Для `amd64` выполняем команду:
 ```bash
 docker container stop nginxmodules1304testingamd64 && docker container rm nginxmodules1304testingamd64
-```
-
-Для `arm64` выполняем команду:
-```bash
 docker container stop nginxmodules1304testingarm64 && docker container rm nginxmodules1304testingarm64
 ```
 
-Содержимое обоих архивов (`nginxmodules_amd64.zip` и `nginxmodules_arm64.zip`) размещаем в репозитории `bitrix-tools/nginx-modules` на [GitHub](https://github.com/bitrix-tools/nginx-modules).
-
-Каждый zip архив содержит:
-- каталог с названием архитектуры: `x86_64` (для `amd64`) или `aarch64` (для `arm64`)
-- файлы модулей в формате пакетов ОС `Alpine Linux` - `*.apk`
-- модули, собранные для работы Nginx в режиме отладки (debug), содержат `dbg` в названии файла
-- файл индекс репозитория - `APKINDEX.tar.gz`
-- rsa ключ подписи файлов модулей в репозитории - `abuild-key.rsa.pub`
-
-Собранные модули для Nginx будут использоваться при сборке образа `bitrix24/nginx`.
-
-Механизм сборки для версии `1.30.4` можно найти в файле `/sources/bxnginx1304/Dockerfile`.
+Содержимое архивов размещается в репозитории [bitrix-tools/nginx-modules](https://github.com/bitrix-tools/nginx-modules) и используется при сборке образа `bitrix24/nginx` (см. `sources/bxnginx1304/Dockerfile`).
 
 <a id="fstkos"></a>
-# Особенности операционных систем сертифицированных ФСТЭК
+## Особенности ОС, сертифицированных ФСТЭК
 
-Сертифицированные ФСТЭК операционные системы включают российские ОС, такие, как `Astra Linux Special Edition`, `РЕД ОС`, `Альт СП` и т.д.
+К ним относятся `Astra Linux Special Edition`, `РЕД ОС`, `Альт СП` и т.д. Обычно они содержат дополнительные средства защиты информации.
 
-Обычно содержат дополнительные средства защиты информации, соответствующие установленным стандартам безопасности.
+### Альт 10 СП
 
-Ниже приведены особенности запуска проекта на этих операционных системах.
+Установка `Docker` и `Docker Compose` из репозиториев ОС:
 
-<a id="alt10sp"></a>
-## Альт 10 СП
-
-Установка `Docker` и `Docker Compose` производится из репозиториев ОС. Для этого выполните команду:
 ```bash
 apt-get install docker-engine containerd docker-buildx docker-cli runc docker-compose-v2
 ```
 
-После установки ПО запустите сервис и активируйте его автозагрузку при старте ОС:
+Запуск сервиса и его автозагрузка:
+
 ```bash
 systemctl restart docker.service && systemctl enable docker.service && systemctl status docker.service --no-pager
 ```
 
-Проверить работу `Docker` в режимах сервер и клиент можно командой:
+Проверка:
+
 ```bash
 docker version
-```
-
-Для проверки `Docker Compose` используется команда:
-```bash
 docker compose version
 ```
 
-Дальнейшее развертывание проекта происходит согласно шагам, описанным в этом файле выше.
+Команды compose пишутся через тире: `docker-compose ***`.
 
-<a id="astralinuxspecialedition18"></a>
-## Astra Linux Special Edition 1.8
+Дальнейшее развертывание - по шагам этой инструкции.
 
-Установка `Docker` и `Docker Compose` производится из репозиториев ОС.
+### Astra Linux Special Edition 1.8
 
-Для этого убедитесь, что активирован главный (repository-main) и расширенный (repository-extended) репозитории. После выполните команду:
+Убеждаемся, что активированы главный (repository-main) и расширенный (repository-extended) репозитории, и устанавливаем:
+
 ```bash
 apt install docker.io containerd runc docker-compose-v2 docker-buildx
 ```
 
-Сервис автоматически будет запущен и будет активирована его автозагрузка при старте ОС.
+Сервис запускается и добавляется в автозагрузку автоматически. Проверка:
 
-Проверить работу `Docker` в режимах сервер и клиент можно командой:
 ```bash
 docker version
-```
-
-Для проверки `Docker Compose` используется команда:
-```bash
 docker compose version
 ```
 
-До запуска проекта необходимо поменять порты для `nginx` в нескольких местах.
+До запуска проекта нужно поменять порт `nginx` (в ОС действуют ограничения на привилегированные порты). В файле `confs/nginx/conf.d/default.conf` меняем `listen 80` на `listen 8080`, после чего указываем новый порт Traefik в labels сервиса `nginx`:
 
-Отредактируйте файл `confs/nginx/conf.d/default.conf`.
-
-Найдите порт `80` и смените его на `8080`. Аналогично, найдите порт `443` и смените его на `8443`.
-
-Отредактируйте файл `docker-compose.yml`.
-
-Найдите сопоставление портов в блоке `ports` сервиса `nginx`:
-
-```bash
-- "8588:80"
-- "8589:443"
-```
-Замените на:
-
-```bash
-- "8588:8080"
-- "8589:8443"
+```yaml
+      - "traefik.http.services.${COMPOSE_PROJECT_NAME:-dev}.loadbalancer.server.port=8080"
 ```
 
-Дальнейшее развертывание проекта происходит согласно шагам, описанным в этом файле выше.
+Если сборка запускается без Traefik, вместо этого правим блок `ports`: вместо `- "8588:80"` указываем `- "8588:8080"`.
+
+Дальнейшее развертывание - по шагам этой инструкции.
+
+<a id="part6"></a>
+# Часть 6. Диагностика типовых проблем
+
+**Контейнер не поднимается или постоянно перезапускается.**
+
+```bash
+docker compose ps
+docker compose logs --tail=100 [сервис]
+```
+
+Чаще всего причина - синтаксическая ошибка в конфигурации, подключенной с хоста (`confs/...`), или занятый порт на хосте.
+
+**Контейнеры не стартуют: `network proxy declared as external, but could not be found`.** Внешней сети Traefik нет на хосте. Создаем ее и подключаем к ней Traefik:
+
+```bash
+docker network create proxy
+```
+
+**Traefik отдает 404 page not found.** Роутер не сматчился. Проверяем по порядку:
+
+```bash
+docker compose config | grep -A15 "labels:"        # во что развернулся SITE_DOMAIN
+docker inspect dev_nginx --format "{{json .NetworkSettings.Networks}}"   # есть ли сеть proxy
+docker logs --tail=50 traefik                       # что говорит сам прокси
+```
+
+Частые причины: пустой или неверный `SITE_DOMAIN` в `.env`, контейнер не в сети Traefik, у Traefik не включен docker provider, запрос пришел на другой домен.
+
+**Цикл редиректов (`ERR_TOO_MANY_REDIRECTS`) или ссылки на http за HTTPS.** Сайт не видит, что исходный запрос был по https. Проверяем, что подключены `confs/nginx/maps/proxy_scheme.conf` и `confs/nginx/inc/proxy_params.conf` (см. [Публикация через Traefik](#traefik)), и что Traefik передает заголовок `X-Forwarded-Proto`:
+
+```bash
+docker compose exec nginx sh -c "wget -q -O /dev/null -H 'X-Forwarded-Proto: https' http://127.0.0.1/ && echo request OK"
+docker compose exec --user=bitrix nginx sh -c "nginx -t"
+```
+
+Дополнительно проверяем, что в настройках главного модуля `URL сайта` указан без `http://` и без порта.
+
+**Сертификат не выпускается.** Смотрим лог Traefik. Обычно причина внешняя: домен из `SITE_DOMAIN` не указывает на IP хоста, закрыт порт `80` (нужен для HTTP-челленджа) или сработал лимит Let's Encrypt.
+
+**В логах и в панели сайта виден IP прокси вместо IP посетителя.** Не подключен `confs/nginx/inc/real_ip.conf` либо адрес прокси не попадает в перечисленные в нем частные сети - добавьте нужную подсеть.
+
+**Порт занят: `bind: address already in use`.** Возникает, если раскомментирован блок `ports` у `nginx`. Меняем левую часть (`"8588:80"`) на свободный порт хоста и перезапускаем: `docker compose up -d`.
+
+**Сайт не видит изменений в файлах / файлы не создаются.** Проверяем права на каталоге `www/` (на Linux-хосте владелец должен быть `979:979`):
+
+```bash
+docker compose exec --user=bitrix php sh -c "touch /opt/www/.write_test && rm /opt/www/.write_test && echo write OK"
+sudo chown -R 979:979 ./www
+```
+
+**Сайт работает медленно на Windows.** Bind mount в каталог на диске `C:` медленный на большом числе файлов - перенесите проект в файловую систему WSL2, см. [Работа с файлами сайта из папки](#worksitefolder).
+
+**Сайт отдает 502 Bad Gateway.** Не отвечает PHP-FPM:
+
+```bash
+docker compose ps php
+docker compose logs --tail=100 php
+```
+
+Проверяем, что контейнер `php` работает и что в `confs/nginx/conf.d/default.conf` в `fastcgi_pass` указано `php:9000`.
+
+**Сайт отдает 403 Forbidden или пустую страницу.** Проверяем, что файлы распакованы в корень тома и принадлежат `bitrix`:
+
+```bash
+docker compose exec --user=bitrix php sh -c "ls -la /opt/www | head"
+docker compose exec --user=root php sh -c "chown -R bitrix:bitrix /opt/www"
+```
+
+**Ошибка подключения к базе на сайте.** Проверяем параметры в `/opt/www/bitrix/.settings.php` и `/opt/www/bitrix/php_interface/dbconn.php` (хост должен быть `mysql`) и доступность базы:
+
+```bash
+docker compose exec mysql mysql -u root -p -e "SHOW DATABASES;"
+```
+
+**Импорт дампа падает с `MySQL server has gone away` / `Packet too large`.** Увеличиваем `max_allowed_packet` в `confs/mysql/etc/my.cnf.d/my.cnf` (см. пункт 5.6), перезапускаем `mysql`, удаляем и создаем базу заново, импортируем повторно.
+
+**"Кракозябры" вместо русских букв.** Кодировка базы не совпадает с исходной. Пересоздаем базу с нужными `CHARACTER SET`/`COLLATE` (пункт 8.1) и импортируем дамп заново с `--default-character-set=utf8mb4`.
+
+**Сайт пытается стучаться на старый сервер (долгие ответы, ошибки соединения).** Не вычищены настройки старого окружения - возвращаемся к [Шагу 10](#step10), проверяем блоки `cache`, `session`, `pull` в `.settings.php` и `.settings_extra.php`.
+
+**Агенты не выполняются.** Проверяем `define("BX_CRONTAB_SUPPORT", true);` в `dbconn.php`, состояние контейнера `cron` и его лог:
+
+```bash
+docker compose logs --tail=50 cron
+```
+
+**Нет места на диске.** Смотрим, что занимает место, и чистим неиспользуемые образы и остановленные контейнеры:
+
+```bash
+docker system df
+docker system prune
+```
+
+> [!CAUTION]
+> Внимание! Не используйте `docker system prune -a --volumes` - эта команда удаляет тома, а вместе с ними сайт и базу.
+
+**Нужно посмотреть, сколько ресурсов потребляют контейнеры:**
+
+```bash
+docker stats
+```
 
 ------------------------------------------------
 
